@@ -185,9 +185,55 @@ class TestDiscordVoiceBot(unittest.TestCase):
         self.assertEqual(res_vc3, new_vc)
         self.assertEqual(bot.current_channel_id, 789)
 
+    def test_bot_local_mode_initialization(self):
+        """Verify is_local flag initialization via parameter and BOT_MODE env var."""
+        bot_default = DiscordVoiceBot()
+        self.assertFalse(bot_default.is_local)
+
+        bot_local = DiscordVoiceBot(is_local=True)
+        self.assertTrue(bot_local.is_local)
+
+        bot_server = DiscordVoiceBot(is_local=False)
+        self.assertFalse(bot_server.is_local)
+
+        # Test env variable detection
+        orig_env = os.environ.get("BOT_MODE")
+        try:
+            os.environ["BOT_MODE"] = "local"
+            bot_from_env = DiscordVoiceBot()
+            self.assertTrue(bot_from_env.is_local)
+
+            os.environ["BOT_MODE"] = "server"
+            bot_from_server_env = DiscordVoiceBot()
+            self.assertFalse(bot_from_server_env.is_local)
+        finally:
+            if orig_env is not None:
+                os.environ["BOT_MODE"] = orig_env
+            else:
+                os.environ.pop("BOT_MODE", None)
+
+    def test_local_direct_stream_enqueue(self):
+        """Verify _async_enqueue_or_play generates direct stream payload when is_local=True."""
+        import asyncio
+        bot = DiscordVoiceBot(is_local=True)
+        # Mock play track so it doesn't try to connect to voice client
+        async def mock_play(track):
+            pass
+        bot._async_play_track = mock_play
+
+        success, msg, is_queued, track = asyncio.run(
+            bot._async_enqueue_or_play("Never gonna give you up")
+        )
+        self.assertTrue(success)
+        self.assertTrue(track.get("is_stream"))
+        self.assertIsNone(track.get("filepath"))
+        self.assertIsNotNone(track.get("url"))
+        self.assertTrue(track["url"].startswith("http"))
+        self.assertIn("Never Gonna Give You Up", track.get("title", ""))
 
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

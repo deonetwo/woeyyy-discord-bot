@@ -85,6 +85,11 @@ def main():
         help="Discord bot token (or set DISCORD_BOT_TOKEN environment variable)",
     )
     parser.add_argument(
+        "--local",
+        action="store_true",
+        help="Run in local direct streaming mode (zero-download, cookies not required)",
+    )
+    parser.add_argument(
         "--set-token",
         type=str,
         default="",
@@ -107,6 +112,12 @@ def main():
         print_banner()
 
         is_daemon = args.daemon or (not sys.stdin.isatty())
+        is_local = args.local or (os.environ.get("BOT_MODE", "").lower() == "local")
+
+        if is_local:
+            print("[INFO] Operating Mode: LOCAL (Direct Stream, Zero-Download, No Cookies)")
+        else:
+            print("[INFO] Operating Mode: SERVER (Cached Download)")
 
         token = args.token or os.environ.get("DISCORD_BOT_TOKEN")
         if not token or token.strip() == "YOUR_BOT_TOKEN_HERE":
@@ -129,7 +140,7 @@ def main():
             if args.token:
                 save_token(args.token)
 
-        bot = DiscordVoiceBot(on_status_change=status_callback)
+        bot = DiscordVoiceBot(on_status_change=status_callback, is_local=is_local)
         print("Connecting to Discord gateway...")
         bot.start(token)
 

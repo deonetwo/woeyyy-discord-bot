@@ -64,8 +64,13 @@ When running interactively (`python main.py`):
 #### Prerequisites
 - Python 3.10 to 3.14 (ensure Python is added to PATH).
 
-#### Quick Start
-Run the launcher script:
+#### Quick Start (Local Direct Stream Mode)
+For running on a local PC (instant playback, zero download wait time, no cookies required):
+```cmd
+run_local.bat
+```
+
+#### Quick Start (Standard Server Mode)
 ```cmd
 run.bat
 ```
@@ -79,10 +84,11 @@ pip install -r requirements.txt
 # Save bot token
 python main.py --set-token "YOUR_BOT_TOKEN"
 
-# Run interactively
-python main.py
+# Run in local direct streaming mode (zero-download)
+python main.py --local
 
-# Or run in daemon mode
+# Or run in standard mode / daemon mode
+python main.py
 python main.py --daemon
 ```
 

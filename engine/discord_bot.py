@@ -111,25 +111,12 @@ YTDL_OPTIONS = {
     "no_warnings": True,
     "default_search": "ytsearch1:",
     "source_address": "0.0.0.0",
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["android_music", "android", "tv_embedded", "ios"],
-            "player_skip": ["web", "mweb"],
-        }
-    },
 }
 
-# Automatically bind cookies.txt if present to authenticate with YouTube
+# Automatically bind cookies.txt if present to authenticate with YouTube (optional fallback)
 COOKIE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cookies.txt"))
 if os.path.exists(COOKIE_PATH):
     YTDL_OPTIONS["cookiefile"] = COOKIE_PATH
-    YTDL_OPTIONS["remote_components"] = ["ejs:github"]
-    YTDL_OPTIONS["format"] = "ba/b"
-    YTDL_OPTIONS["extractor_args"] = {
-        "youtube": {
-            "player_client": ["web", "web_embedded", "mweb"],
-        }
-    }
 
 FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
@@ -411,8 +398,15 @@ class DiscordVoiceBot:
     Runs commands.Bot in a dedicated asyncio background loop.
     """
 
-    def __init__(self, on_status_change: Optional[Callable[[str, str], None]] = None):
+    def __init__(
+        self,
+        on_status_change: Optional[Callable[[str, str], None]] = None,
+        is_local: Optional[bool] = None,
+    ):
         self.on_status_change = on_status_change
+        self.is_local: bool = (
+            is_local if is_local is not None else (os.environ.get("BOT_MODE", "").lower() == "local")
+        )
 
         self.client: Optional[commands.Bot] = None
         self.voice_client: Optional[discord.VoiceClient] = None
@@ -945,7 +939,8 @@ class DiscordVoiceBot:
     async def _async_enqueue_or_play(self, query_or_url: str, requester: str = "Host") -> Tuple[bool, str, bool, Dict[str, any]]:
         """
         Extract stream info using yt-dlp with YouTube Music normalization.
-        If something is playing, enqueue track. Otherwise, play immediately.
+        When is_local=True: Uses direct streaming (download=False) without cookies for instant playback.
+        When is_local=False: Uses cached download (download=True) into cache/ for cloud/server stability.
         Returns: (success, message, is_queued, track_dict)
         """
         try:
@@ -957,34 +952,77 @@ class DiscordVoiceBot:
             if not (sanitized_target.startswith("http://") or sanitized_target.startswith("https://")):
                 sanitized_target = f"ytsearch1:{sanitized_target}"
 
-            # Setup local cache folder
             cache_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cache"))
             os.makedirs(cache_dir, exist_ok=True)
 
-            opts = dict(YTDL_OPTIONS)
-            opts["outtmpl"] = os.path.join(cache_dir, "%(id)s.%(ext)s")
-            opts["noplaylist"] = True
-
             loop = asyncio.get_event_loop()
-            ytdl = yt_dlp.YoutubeDL(opts)
-            data = await loop.run_in_executor(
-                None, lambda: ytdl.extract_info(sanitized_target, download=True)
-            )
+            data = None
+            direct_url = None
+            filepath = None
+            http_headers = {}
 
-            if "entries" in data:
-                entries = [e for e in data["entries"] if e]
-                if not entries:
+            if self.is_local:
+                # Local Mode: Direct Streaming without full file download & without cookies
+                stream_opts = dict(YTDL_OPTIONS)
+                stream_opts.pop("cookiefile", None)
+                stream_opts["noplaylist"] = True
+                try:
+                    ytdl_stream = yt_dlp.YoutubeDL(stream_opts)
+                    data = await loop.run_in_executor(
+                        None, lambda: ytdl_stream.extract_info(sanitized_target, download=False)
+                    )
+                except Exception as stream_err:
+                    print(f"[DiscordBot] Local direct stream extraction notice: {stream_err}")
+
+                if data and "entries" in data:
+                    entries = [e for e in data["entries"] if e]
+                    data = entries[0] if entries else None
+
+                if data:
+                    direct_url = data.get("url")
+                    http_headers = data.get("http_headers", {})
+                    if not direct_url and "formats" in data:
+                        audio_formats = [
+                            f for f in data["formats"]
+                            if f.get("url") and (f.get("vcodec") == "none" or "audio" in f.get("format", "").lower() or f.get("acodec") != "none")
+                        ]
+                        if audio_formats:
+                            best_fmt = audio_formats[-1]
+                            direct_url = best_fmt.get("url")
+                            if "http_headers" in best_fmt:
+                                http_headers = best_fmt.get("http_headers")
+
+            # Fallback or Server Mode: Download to cache folder
+            if not direct_url:
+                dl_opts = dict(YTDL_OPTIONS)
+                dl_opts["outtmpl"] = os.path.join(cache_dir, "%(id)s.%(ext)s")
+                dl_opts["noplaylist"] = True
+
+                ytdl_dl = yt_dlp.YoutubeDL(dl_opts)
+                data = await loop.run_in_executor(
+                    None, lambda: ytdl_dl.extract_info(sanitized_target, download=True)
+                )
+
+                if data and "entries" in data:
+                    entries = [e for e in data["entries"] if e]
+                    if not entries:
+                        return False, "Track not found.", False, {}
+                    data = entries[0]
+
+                if not data:
                     return False, "Track not found.", False, {}
-                data = entries[0]
 
-            # Resolve local downloaded audio file path
-            filepath = ytdl.prepare_filename(data)
-            if not os.path.exists(filepath):
-                vid_id = data.get("id", "")
-                for fname in os.listdir(cache_dir):
-                    if fname.startswith(vid_id):
-                        filepath = os.path.join(cache_dir, fname)
-                        break
+                filepath = ytdl_dl.prepare_filename(data)
+                if not os.path.exists(filepath):
+                    vid_id = data.get("id", "")
+                    for fname in os.listdir(cache_dir):
+                        if fname.startswith(vid_id):
+                            filepath = os.path.join(cache_dir, fname)
+                            break
+                direct_url = filepath
+
+            if not data:
+                return False, "Track not found.", False, {}
 
             title = data.get("title", query_or_url)
             uploader = data.get("uploader") or data.get("channel") or data.get("artist") or ""
@@ -993,13 +1031,16 @@ class DiscordVoiceBot:
 
             track = {
                 "filepath": filepath,
-                "url": filepath if os.path.exists(filepath) else data.get("url"),
+                "url": direct_url,
                 "title": title,
                 "uploader": uploader,
                 "duration_sec": sec,
                 "duration_str": dur_str,
                 "webpage_url": data.get("webpage_url", query_or_url),
                 "requester": requester,
+                "http_headers": http_headers or data.get("http_headers", {}),
+                "is_stream": filepath is None,
+                "timestamp": time.time(),
             }
 
             # Check if playback is currently active
@@ -1017,7 +1058,7 @@ class DiscordVoiceBot:
             return False, str(e), False, {}
 
     async def _async_play_track(self, track: Dict[str, any]):
-        """Play track on current voice_client (using cached local file or fallback stream)."""
+        """Play track on current voice_client (using direct stream URL or cached file)."""
         if not self.voice_client or not self.voice_client.is_connected():
             return
 
@@ -1032,35 +1073,96 @@ class DiscordVoiceBot:
             ffmpeg_bin = get_ffmpeg_binary()
             audio_src = track.get("filepath") or track.get("url")
 
+            # Dynamic refresh for long-queued direct stream URLs (> 2 hours)
+            if track.get("is_stream") and track.get("webpage_url"):
+                age = time.time() - track.get("timestamp", 0)
+                if not audio_src or age > 7200:
+                    try:
+                        loop = asyncio.get_event_loop()
+                        stream_opts = dict(YTDL_OPTIONS)
+                        if self.is_local:
+                            stream_opts.pop("cookiefile", None)
+                        stream_opts["noplaylist"] = True
+                        ytdl_refresh = yt_dlp.YoutubeDL(stream_opts)
+                        refreshed = await loop.run_in_executor(
+                            None, lambda: ytdl_refresh.extract_info(track["webpage_url"], download=False)
+                        )
+                        if refreshed:
+                            if "entries" in refreshed and refreshed["entries"]:
+                                refreshed = refreshed["entries"][0]
+                            audio_src = refreshed.get("url")
+                            track["url"] = audio_src
+                            if "http_headers" in refreshed:
+                                track["http_headers"] = refreshed["http_headers"]
+                            track["timestamp"] = time.time()
+                    except Exception as refresh_err:
+                        print(f"[DiscordBot] Stream refresh error: {refresh_err}")
+
             if audio_src and os.path.exists(audio_src):
                 source = discord.FFmpegPCMAudio(
                     audio_src,
                     executable=ffmpeg_bin,
                     options="-vn",
-                    stderr=subprocess.PIPE,
                 )
             else:
                 headers = track.get("http_headers") or {}
                 user_agent = headers.get("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-                referer = headers.get("Referer", "https://www.youtube.com/")
                 before_opts = (
                     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
                     f' -user_agent "{user_agent}"'
-                    f' -referer "{referer}"'
                 )
                 source = discord.FFmpegPCMAudio(
                     audio_src,
                     executable=ffmpeg_bin,
                     before_options=before_opts,
                     options="-vn",
-                    stderr=subprocess.PIPE,
                 )
             transformer = discord.PCMVolumeTransformer(source, volume=self.volume)
 
             def _after_play(error):
-                if error:
-                    print(f"[DiscordBot] Playback error: {error}")
-                    self._notify_status("ERROR", f"Playback error: {error}")
+                actual_error = error
+                if not actual_error and hasattr(source, "_current_error") and source._current_error:
+                    actual_error = source._current_error
+
+                if actual_error:
+                    print(f"[DiscordBot] Playback error: {actual_error}")
+                    self._notify_status("ERROR", f"Playback error: {actual_error}")
+
+                # If direct stream failed immediately, fallback automatically to download mode
+                if actual_error and track.get("is_stream") and not track.get("_retried_as_download"):
+                    print(f"[DiscordBot] Stream encountered error, falling back to download for: {track.get('title')}")
+                    track["_retried_as_download"] = True
+                    if self._loop and self._loop.is_running():
+                        async def _fallback_download():
+                            try:
+                                cache_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cache"))
+                                os.makedirs(cache_dir, exist_ok=True)
+                                dl_opts = dict(YTDL_OPTIONS)
+                                dl_opts["outtmpl"] = os.path.join(cache_dir, "%(id)s.%(ext)s")
+                                dl_opts["noplaylist"] = True
+                                ytdl_dl = yt_dlp.YoutubeDL(dl_opts)
+                                fallback_data = await self._loop.run_in_executor(
+                                    None, lambda: ytdl_dl.extract_info(track["webpage_url"], download=True)
+                                )
+                                if fallback_data and "entries" in fallback_data and fallback_data["entries"]:
+                                    fallback_data = fallback_data["entries"][0]
+                                dl_filepath = ytdl_dl.prepare_filename(fallback_data)
+                                if not os.path.exists(dl_filepath):
+                                    vid_id = fallback_data.get("id", "")
+                                    for fname in os.listdir(cache_dir):
+                                        if fname.startswith(vid_id):
+                                            dl_filepath = os.path.join(cache_dir, fname)
+                                            break
+                                if dl_filepath and os.path.exists(dl_filepath):
+                                    track["filepath"] = dl_filepath
+                                    track["url"] = dl_filepath
+                                    track["is_stream"] = False
+                                    await self._async_play_track(track)
+                                    return
+                            except Exception as dl_err:
+                                print(f"[DiscordBot] Fallback download failed: {dl_err}")
+                        asyncio.run_coroutine_threadsafe(_fallback_download(), self._loop)
+                        return
 
                 # Auto-cleanup cached file after song completes to preserve storage space
                 try:
