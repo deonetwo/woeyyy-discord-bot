@@ -1,0 +1,155 @@
+# Woeyyy - Discord Bot
+
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Discord.py](https://img.shields.io/badge/discord.py-v2.3%2B-5865F2.svg)](https://github.com/Rapptz/discord.py)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
+Woeyyy is a headless Discord bot built with discord.py and yt-dlp. It runs with low memory overhead (~25MB RAM).
+
+The project is completely headless, with no GUI dependencies or local audio device requirements. It can run continuously on Linux servers (Ubuntu/Debian/systemd) or Windows.
+
+## Features
+
+- **Direct Voice Streaming**: Plays 48kHz stereo Opus audio directly into Discord voice channels.
+- **YouTube and YouTube Music**: Supports search queries, regular YouTube links, and `music.youtube.com` URL normalization.
+- **Slash Commands & Autocomplete**: Search suggestions appear in chat when typing `/play`.
+- **Queue Management**: Enqueues tracks, automatically advances to the next song, and supports track skipping.
+- **Input Sanitization & Process Isolation**: Single-instance mutex on Windows, SSRF prevention on user-supplied URLs, and safe token storage.
+- **Dual Execution Modes**: Interactive CLI mode for manual testing and background daemon mode for production servers.
+
+## Commands
+
+### Slash Commands
+
+| Command | Description |
+|---|---|
+| `/play <query/url>` | Play audio or add to queue |
+| `/skip` | Skip the currently playing track |
+| `/pause` | Pause playback |
+| `/resume` | Resume playback |
+| `/queue` | Display current track queue |
+| `/clear` | Clear the track queue |
+| `/stop` | Stop playback and clear queue |
+| `/volume <0-150>` | Set playback volume percentage |
+| `/leave` | Disconnect bot from voice channel |
+
+### Terminal CLI Commands
+
+When running interactively (`python main.py`):
+- `p, play <query/url>`: Play track in voice channel
+- `j, join [channel]`: Connect bot to voice channel
+- `l, leave`: Disconnect from voice channel
+- `s, skip`: Skip current track
+- `q, queue`: Display queue status
+- `pause` / `resume`: Pause or resume playback
+- `stop`: Stop playback and clear queue
+- `v, vol <0-150>`: Set volume percentage
+- `help`: Display help message
+- `exit`, `quit`: Disconnect and exit
+
+## Discord Developer Portal Setup
+
+1. Open the [Discord Developer Portal](https://discord.com/developers/applications) and click **New Application**.
+2. Go to the **Bot** tab, click **Reset Token**, and copy the token.
+3. Under **Privileged Gateway Intents**, enable **Message Content Intent** and save changes.
+4. Go to **OAuth2 -> URL Generator**:
+   - Under **Scopes**, select `bot` and `applications.commands`.
+   - Under **Bot Permissions**, select `Send Messages`, `Read Message History`, `Embed Links`, `Connect`, `Speak`, and `Use Voice Activity`.
+5. Copy the generated URL, open it in a browser, and invite the bot to your server.
+
+## Installation and Usage
+
+### Windows
+
+#### Prerequisites
+- Python 3.10 to 3.14 (ensure Python is added to PATH).
+
+#### Quick Start
+Run the launcher script:
+```cmd
+run.bat
+```
+
+#### Manual Setup
+```cmd
+python -m venv .venv
+call .venv\Scripts\activate.bat
+pip install -r requirements.txt
+
+# Save bot token
+python main.py --set-token "YOUR_BOT_TOKEN"
+
+# Run interactively
+python main.py
+
+# Or run in daemon mode
+python main.py --daemon
+```
+
+### Linux (Ubuntu / Debian / AWS EC2)
+
+#### 1. System Dependencies
+```bash
+sudo apt update && sudo apt install -y python3 python3-pip python3-venv git ffmpeg libopus0 libopus-dev
+```
+
+#### 2. Project Setup
+```bash
+git clone https://github.com/dewanto-ar/woeyyy-discord-bot.git
+cd woeyyy-discord-bot
+
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+#### 3. Token Configuration
+Create a `.env` file:
+```bash
+echo "DISCORD_BOT_TOKEN=YOUR_BOT_TOKEN" > .env
+```
+
+#### 4. Running with Systemd
+```bash
+sudo cp woeyyy-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now woeyyy-bot
+```
+
+#### 5. Service Management
+```bash
+sudo systemctl status woeyyy-bot
+sudo journalctl -u woeyyy-bot -f
+sudo systemctl restart woeyyy-bot
+sudo systemctl stop woeyyy-bot
+```
+
+## Testing
+
+Run unit tests with Python's built-in test runner:
+```bash
+python -m unittest discover tests
+```
+
+## Project Structure
+
+```text
+woeyyy-discord-bot/
+├── engine/
+│   ├── __init__.py         # Package exports
+│   ├── discord_bot.py      # Core Discord voice client & streaming logic
+│   └── security.py         # Mutex isolation, token masking, and URL sanitization
+├── tests/
+│   ├── test_discord_bot.py # Discord bot unit tests
+│   └── test_security.py    # Security validation unit tests
+├── bot_cli.py              # CLI entry point wrapper
+├── main.py                 # Primary entry point
+├── requirements.txt        # Python package dependencies
+├── run.bat                 # Windows setup and launcher script
+├── run_bot.bat             # Windows launcher script
+├── woeyyy-bot.service      # Systemd service unit definition
+└── README.md
+```
+
+## License
+Distributed under the MIT License.
