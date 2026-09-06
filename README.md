@@ -96,7 +96,11 @@ python main.py --daemon
 
 #### 1. System Dependencies
 ```bash
-sudo apt update && sudo apt install -y python3 python3-pip python3-venv git ffmpeg libopus0 libopus-dev
+sudo apt update && sudo apt install -y python3 python3-pip python3-venv git ffmpeg libopus0 libopus-dev unzip
+
+# Install Deno (JavaScript runtime for yt-dlp)
+curl -fsSL https://deno.land/install.sh | sh
+sudo cp ~/.deno/bin/deno /usr/local/bin/
 ```
 
 #### 2. Project Setup
@@ -109,12 +113,17 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-
-#### 3. Token Configuration
+#### 3. Token & Cookies Configuration
 Create a `.env` file with your bot token:
 ```bash
 echo "DISCORD_BOT_TOKEN=YOUR_BOT_TOKEN" > .env
 chmod 600 .env
+```
+
+Optional: To enable authenticated session support on headless servers, place an exported Netscape-format `cookies.txt` into the project root:
+```bash
+# Upload cookies.txt to /home/ubuntu/woeyyy-discord-bot/cookies.txt
+chmod 600 cookies.txt
 ```
 
 #### 4. Running with Systemd
