@@ -1658,20 +1658,22 @@ class DiscordVoiceBot:
                 source = discord.FFmpegPCMAudio(
                     audio_src,
                     executable=ffmpeg_bin,
-                    options="-vn",
+                    before_options="-probesize 32k -analyzeduration 0",
+                    options="-vn -threads 1",
                 )
             else:
                 headers = track.get("http_headers") or {}
                 user_agent = headers.get("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
                 before_opts = (
                     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+                    " -probesize 32k -analyzeduration 0"
                     f' -user_agent "{user_agent}"'
                 )
                 source = discord.FFmpegPCMAudio(
                     audio_src,
                     executable=ffmpeg_bin,
                     before_options=before_opts,
-                    options="-vn",
+                    options="-vn -threads 1",
                 )
             transformer = discord.PCMVolumeTransformer(source, volume=self.volume)
             play_start_time = time.time()
@@ -1799,6 +1801,16 @@ class DiscordVoiceBot:
                         asyncio.run_coroutine_threadsafe(
                             self._update_voice_channel_status("Waiting for song requests"), self._loop
                         )
+
+            # Warm up Discord voice UDP connection with silence frames to prevent initial 0-5s jitter/packet drop
+            try:
+                if self.voice_client and self.voice_client.is_connected() and hasattr(self.voice_client, "send_audio_packet"):
+                    silence_frame = b"\xF8\xFF\xFE"
+                    for _ in range(5):
+                        self.voice_client.send_audio_packet(silence_frame, encode=False)
+                        await asyncio.sleep(0.02)
+            except Exception:
+                pass
 
             self.voice_client.play(transformer, after=_after_play)
             self.is_playing = True
