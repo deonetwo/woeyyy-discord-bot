@@ -382,6 +382,35 @@ class TestDiscordVoiceBot(unittest.TestCase):
 
         bot.clear_user_history(test_uid)
 
+    def test_get_random_server_emoji(self):
+        """Test get_random_server_emoji returns server custom emoji when available or fallback."""
+        from unittest.mock import MagicMock
+        from engine.discord_bot import get_random_server_emoji
+
+        # 1. Guild is None -> fallback
+        emoji_none = get_random_server_emoji(None)
+        self.assertIn(emoji_none, ["🎵", "🎶", "🎧", "✨"])
+
+        # 2. Guild has empty emojis -> fallback
+        mock_guild_empty = MagicMock()
+        mock_guild_empty.emojis = []
+        emoji_empty = get_random_server_emoji(mock_guild_empty)
+        self.assertIn(emoji_empty, ["🎵", "🎶", "🎧", "✨"])
+
+        # 3. Guild has custom emojis -> picks from server emojis
+        mock_emoji1 = MagicMock()
+        mock_emoji1.__str__.return_value = "<:pepejam:111222333>"
+        mock_emoji1.available = True
+        mock_emoji2 = MagicMock()
+        mock_emoji2.__str__.return_value = "<a:blobdance:444555666>"
+        mock_emoji2.available = True
+
+        mock_guild = MagicMock()
+        mock_guild.emojis = [mock_emoji1, mock_emoji2]
+
+        picked = get_random_server_emoji(mock_guild)
+        self.assertIn(picked, ["<:pepejam:111222333>", "<a:blobdance:444555666>"])
+
 
 if __name__ == "__main__":
     unittest.main()

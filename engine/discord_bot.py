@@ -8,6 +8,7 @@ import asyncio
 import html
 import json
 import os
+import random
 import subprocess
 import sys
 import threading
@@ -141,6 +142,15 @@ def normalize_youtube_url(query: str) -> str:
     if "music.youtube.com" in target:
         target = target.replace("music.youtube.com", "www.youtube.com")
     return target
+
+
+def get_random_server_emoji(guild: Optional[discord.Guild]) -> str:
+    """Return a random custom emoji from the server, or a music emoji if none exist."""
+    if guild and getattr(guild, "emojis", None):
+        custom_emojis = [e for e in guild.emojis if getattr(e, "available", True)]
+        if custom_emojis:
+            return str(random.choice(custom_emojis))
+    return random.choice(["🎵", "🎶", "🎧", "✨"])
 
 
 async def async_search_youtube_suggestions(
@@ -703,11 +713,14 @@ class DiscordVoiceBot:
                 uploader_part = f" by **{uploader}**" if uploader else ""
                 dur_part = f" (`{dur}`)" if dur else ""
 
+                emoji = get_random_server_emoji(interaction.guild)
+                prefix = f"{emoji} " if emoji else ""
+
                 if is_queued:
                     pos = len(self.queue)
-                    msg_text = f"Added {link_part}{uploader_part}{dur_part} to the queue at position #{pos}."
+                    msg_text = f"{prefix}Added {link_part}{uploader_part}{dur_part} to the queue at position #{pos}."
                 else:
-                    msg_text = f"Added {link_part}{uploader_part}{dur_part} to begin playing."
+                    msg_text = f"{prefix}Added {link_part}{uploader_part}{dur_part} to begin playing."
 
                 await msg_handle.edit(content=msg_text)
             except Exception as e:
@@ -805,8 +818,11 @@ class DiscordVoiceBot:
                 next_up = f" by **{next_uploader}**" if next_uploader else ""
                 next_dur_part = f" (`{next_dur}`)" if next_dur else ""
 
+                emoji = get_random_server_emoji(interaction.guild)
+                prefix = f"{emoji} " if emoji else ""
+
                 await interaction.response.send_message(
-                    f"Skipped **{old_title}**.\nNow playing {next_link}{next_up}{next_dur_part}.",
+                    f"{prefix}Skipped **{old_title}**.\nNow playing {next_link}{next_up}{next_dur_part}.",
                     suppress_embeds=True,
                 )
             else:
@@ -830,7 +846,10 @@ class DiscordVoiceBot:
                 cur_link = f"**[{c_title}](<{c_url}>)**" if c_url else f"**{c_title}**"
                 cur_up = f" by **{c_up}**" if c_up else ""
                 cur_dur = f" (`{c_dur}`)" if c_dur else ""
-                lines.append(f"Now playing: {cur_link}{cur_up}{cur_dur}")
+
+                emoji = get_random_server_emoji(interaction.guild)
+                prefix = f"{emoji} " if emoji else ""
+                lines.append(f"{prefix}Now playing: {cur_link}{cur_up}{cur_dur}")
 
             if self.queue:
                 lines.append(f"\nQueue ({len(self.queue)} tracks):")
@@ -1092,7 +1111,7 @@ class DiscordVoiceBot:
             target = normalize_youtube_url(query_or_url)
             is_safe, sanitized_target, reason = sanitize_audio_target(target)
             if not is_safe:
-                return False, f"Keamanan: Tautan ditolak ({reason})", False, {}
+                return False, f"Security: URL rejected ({reason})", False, {}
 
             if not (sanitized_target.startswith("http://") or sanitized_target.startswith("https://")):
                 sanitized_target = f"ytsearch1:{sanitized_target}"
