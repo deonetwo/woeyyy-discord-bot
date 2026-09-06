@@ -154,8 +154,13 @@ woeyyy-discord-bot/
 ├── run.bat                 # Windows setup and launcher script
 ├── run_bot.bat             # Windows launcher script
 ├── woeyyy-bot.service      # Systemd service unit definition
+├── KNOWN_ISSUES.md         # Environment limitations and known issues
 └── README.md
 ```
+
+## Known Issues
+
+For details on known limitations and environment-specific notes (such as local Windows audio playback behavior), see [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
 ## License
 Distributed under the MIT License.
