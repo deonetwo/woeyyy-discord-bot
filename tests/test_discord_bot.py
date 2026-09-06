@@ -231,6 +231,85 @@ class TestDiscordVoiceBot(unittest.TestCase):
         self.assertTrue(track["url"].startswith("http"))
         self.assertIn("Never Gonna Give You Up", track.get("title", ""))
 
+    def test_user_history_recording_and_cap(self):
+        """Test user history records songs, enforces max 25 limit, and moves existing song to top."""
+        bot = DiscordVoiceBot()
+        test_uid = 999888777
+        bot.clear_user_history(test_uid)
+
+        # 1. Add songs up to 30
+        for i in range(1, 31):
+            bot.record_user_history(test_uid, {
+                "title": f"Song {i}",
+                "uploader": f"Artist {i}",
+                "webpage_url": f"https://youtube.com/watch?v={i}",
+                "duration_str": "3:00",
+            })
+
+        history = bot.get_user_history(test_uid)
+        # Verify cap at 25
+        self.assertEqual(len(history), 25)
+        # Verify newest is first
+        self.assertEqual(history[0]["title"], "Song 30")
+        self.assertEqual(history[-1]["title"], "Song 6")
+
+        # 2. Test deduplication - replaying Song 10 moves it to top
+        bot.record_user_history(test_uid, {
+            "title": "Song 10",
+            "uploader": "Artist 10",
+            "webpage_url": "https://youtube.com/watch?v=10",
+            "duration_str": "3:00",
+        })
+        history = bot.get_user_history(test_uid)
+        self.assertEqual(len(history), 25)
+        self.assertEqual(history[0]["title"], "Song 10")
+        self.assertEqual(history[1]["title"], "Song 30")
+
+        # Cleanup
+        bot.clear_user_history(test_uid)
+        self.assertEqual(len(bot.get_user_history(test_uid)), 0)
+
+    def test_autocomplete_history_formatting(self):
+        """Test autocomplete produces expected clock icon choices from user history."""
+        import asyncio
+        from unittest.mock import MagicMock
+        import discord
+        from discord.ext import commands
+
+        bot = DiscordVoiceBot()
+        test_uid = 111222333
+        bot.clear_user_history(test_uid)
+
+        bot.record_user_history(test_uid, {
+            "title": "Hidamari Official Music Video",
+            "uploader": "MsOOJA Channel",
+            "webpage_url": "https://youtube.com/watch?v=hidamari",
+            "duration_str": "4:15",
+        })
+
+        intents = discord.Intents.default()
+        bot.client = commands.Bot(command_prefix="!", intents=intents)
+        bot._register_slash_commands()
+        # Find play command
+        cmd = None
+        for command in bot.client.tree.get_commands():
+            if command.name == "play":
+                cmd = command
+                break
+
+        self.assertIsNotNone(cmd)
+        mock_interaction = MagicMock()
+        mock_interaction.user.id = test_uid
+
+        # Test empty query autocomplete returns history with clock icon
+        choices = asyncio.run(cmd._params["query"].autocomplete(mock_interaction, ""))
+        self.assertEqual(len(choices), 1)
+        self.assertTrue(choices[0].name.startswith("🕒 "))
+        self.assertIn("MsOOJA Channel - Hidamari Official Music Video", choices[0].name)
+        self.assertEqual(choices[0].value, "https://youtube.com/watch?v=hidamari")
+
+        bot.clear_user_history(test_uid)
+
 
 if __name__ == "__main__":
     unittest.main()

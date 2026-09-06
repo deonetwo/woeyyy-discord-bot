@@ -14,7 +14,7 @@ import threading
 import time
 import urllib.parse
 import warnings
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 import discord
@@ -287,6 +287,31 @@ async def async_search_youtube_suggestions(
 
 ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env"))
 CONFIG_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".bot_config.json"))
+USER_HISTORY_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cache", "user_history.json"))
+
+
+def load_user_history() -> Dict[str, List[Dict[str, any]]]:
+    """Load persistent song play history per user from cache/user_history.json."""
+    if os.path.exists(USER_HISTORY_PATH):
+        try:
+            with open(USER_HISTORY_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception as e:
+            print(f"[DiscordBot] Warning: failed to load user history: {e}")
+    return {}
+
+
+def save_user_history(history: Dict[str, List[Dict[str, any]]]):
+    """Save persistent song play history to cache/user_history.json."""
+    try:
+        cache_dir = os.path.dirname(USER_HISTORY_PATH)
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(USER_HISTORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[DiscordBot] Warning: failed to save user history: {e}")
 
 
 def load_saved_token() -> str:
@@ -440,6 +465,53 @@ class DiscordVoiceBot:
         self._http_session: Optional[aiohttp.ClientSession] = None
 
         self.ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+        self.user_history: Dict[str, List[Dict[str, any]]] = load_user_history()
+        self._history_lock = threading.Lock()
+
+    def record_user_history(self, user_id: Union[int, str], track: Dict[str, any]):
+        """Record a played/enqueued song to user history (max 25 songs, FIFO with deduplication)."""
+        uid = str(user_id)
+        if not uid or not track:
+            return
+
+        title = track.get("title") or "Unknown Title"
+        uploader = track.get("uploader") or ""
+        url = track.get("webpage_url") or track.get("url") or ""
+        dur = track.get("duration_str") or ""
+
+        entry = {
+            "title": title,
+            "uploader": uploader,
+            "webpage_url": url,
+            "duration_str": dur,
+            "played_at": int(time.time()),
+        }
+
+        with self._history_lock:
+            user_list = self.user_history.get(uid, [])
+            key_val = url.strip() if url else title.strip().lower()
+            filtered = [
+                item for item in user_list
+                if (item.get("webpage_url", "").strip() if url else item.get("title", "").strip().lower()) != key_val
+            ]
+            new_list = [entry] + filtered
+            self.user_history[uid] = new_list[:25]
+            save_user_history(self.user_history)
+
+    def get_user_history(self, user_id: Union[int, str]) -> List[Dict[str, any]]:
+        """Get copy of user song history."""
+        uid = str(user_id)
+        with self._history_lock:
+            return list(self.user_history.get(uid, []))
+
+    def clear_user_history(self, user_id: Union[int, str]) -> int:
+        """Clear user history and return count of deleted items."""
+        uid = str(user_id)
+        with self._history_lock:
+            count = len(self.user_history.get(uid, []))
+            self.user_history.pop(uid, None)
+            save_user_history(self.user_history)
+            return count
 
     async def _get_http_session(self) -> aiohttp.ClientSession:
         """Get or lazily create a persistent aiohttp.ClientSession for the bot loop."""
@@ -638,15 +710,38 @@ class DiscordVoiceBot:
                     suppress=True,
                 )
 
+            # Record track to user's history
+            if track:
+                self.record_user_history(interaction.user.id, track)
+
         @cmd_play.autocomplete("query")
         async def play_autocomplete(
             interaction: discord.Interaction,
             current: str,
         ) -> List[app_commands.Choice[str]]:
-            if not current or not current.strip():
-                return []
+            clean = current.strip() if current else ""
 
-            suggestions = await self.get_autocomplete_suggestions(current)
+            if not clean:
+                # Return user's recent history songs (up to 25 items)
+                user_id = str(interaction.user.id)
+                history = self.get_user_history(user_id)
+                choices = []
+                for item in history[:25]:
+                    title = item.get("title", "").strip()
+                    uploader = item.get("uploader", "").strip()
+                    if uploader and not title.lower().startswith(uploader.lower()):
+                        label = f"{uploader} - {title}"
+                    else:
+                        label = title
+                    name = f"🕒 {label}"
+                    if len(name) > 100:
+                        name = name[:97] + "..."
+                    val = (item.get("webpage_url") or title)[:100]
+                    choices.append(app_commands.Choice(name=name, value=val))
+                return choices
+
+            # When user enters a query, query YouTube suggestions directly (original behavior)
+            suggestions = await self.get_autocomplete_suggestions(clean)
             return [
                 app_commands.Choice(name=item["name"], value=item["value"])
                 for item in suggestions[:25]
