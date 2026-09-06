@@ -301,12 +301,84 @@ class TestDiscordVoiceBot(unittest.TestCase):
         mock_interaction = MagicMock()
         mock_interaction.user.id = test_uid
 
-        # Test empty query autocomplete returns history with clock icon
+        # Test empty query autocomplete returns history
         choices = asyncio.run(cmd._params["query"].autocomplete(mock_interaction, ""))
         self.assertEqual(len(choices), 1)
-        self.assertTrue(choices[0].name.startswith("🕒 "))
-        self.assertIn("MsOOJA Channel - Hidamari Official Music Video", choices[0].name)
+        self.assertEqual(choices[0].name, "MsOOJA Channel - Hidamari Official Music Video")
         self.assertEqual(choices[0].value, "https://youtube.com/watch?v=hidamari")
+
+        # Test query filtering returns matching history first
+        choices_filtered = asyncio.run(cmd._params["query"].autocomplete(mock_interaction, "hidamari"))
+        self.assertGreaterEqual(len(choices_filtered), 1)
+        self.assertEqual(choices_filtered[0].name, "MsOOJA Channel - Hidamari Official Music Video")
+
+        # Test empty choices returned when user has no history
+        mock_new_user = MagicMock()
+        mock_new_user.user.id = 999111222
+        bot.clear_user_history(999111222)
+        no_history_choices = asyncio.run(cmd._params["query"].autocomplete(mock_new_user, ""))
+        self.assertEqual(len(no_history_choices), 0)
+        self.assertEqual(no_history_choices, [])
+
+        bot.clear_user_history(test_uid)
+
+    def test_cmd_play_message_edit_no_suppress(self):
+        """Test cmd_play edits msg_handle without invalid suppress parameter and records history."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import discord
+        from discord.ext import commands
+
+        bot = DiscordVoiceBot()
+        test_uid = 444555666
+        bot.clear_user_history(test_uid)
+
+        intents = discord.Intents.default()
+        bot.client = commands.Bot(command_prefix="!", intents=intents)
+        bot._register_slash_commands()
+
+        cmd = None
+        for command in bot.client.tree.get_commands():
+            if command.name == "play":
+                cmd = command
+                break
+        self.assertIsNotNone(cmd)
+
+        mock_interaction = MagicMock()
+        mock_interaction.user.id = test_uid
+        mock_interaction.user.display_name = "TestUser"
+        mock_interaction.user.voice.channel = MagicMock()
+        mock_interaction.response.defer = AsyncMock()
+
+        # Mock msg_handle
+        mock_msg_handle = MagicMock()
+        mock_msg_handle.edit = AsyncMock()
+        mock_interaction.followup.send = AsyncMock(return_value=mock_msg_handle)
+
+        sample_track = {
+            "title": "Special Song",
+            "uploader": "Special Artist",
+            "webpage_url": "https://youtube.com/watch?v=specialsong",
+            "duration_str": "3:45",
+        }
+
+        with patch.object(bot, "_ensure_voice_connected", new=AsyncMock()), \
+             patch.object(bot, "_async_enqueue_or_play", new=AsyncMock(return_value=(True, "Now playing", False, sample_track))):
+            asyncio.run(cmd.callback(mock_interaction, "Special Song"))
+
+        # Check msg_handle.edit was called
+        mock_msg_handle.edit.assert_called_once()
+        call_kwargs = mock_msg_handle.edit.call_args[1]
+        self.assertIn("content", call_kwargs)
+        self.assertIn("Special Song", call_kwargs["content"])
+        self.assertIn("Special Artist", call_kwargs["content"])
+        # Crucial check: verify suppress was NOT passed (which caused TypeError on WebhookMessage)
+        self.assertNotIn("suppress", call_kwargs)
+
+        # Verify track was recorded to user history
+        history = bot.get_user_history(test_uid)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["title"], "Special Song")
 
         bot.clear_user_history(test_uid)
 

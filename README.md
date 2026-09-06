@@ -12,7 +12,8 @@ The project is completely headless, with no GUI dependencies or local audio devi
 
 - **Direct Voice Streaming**: Plays 48kHz stereo Opus audio directly into Discord voice channels.
 - **YouTube and YouTube Music**: Supports search queries, regular YouTube links, and `music.youtube.com` URL normalization.
-- **Slash Commands & Autocomplete**: Search suggestions appear in chat when typing `/play`.
+- **Slash Commands & Autocomplete**: Autocomplete suggestions appear in chat when typing `/play`, prioritizing your recent playback history.
+- **Stream Auto-Recovery**: Automatically detects premature stream termination and falls back to cached download.
 - **Queue Management**: Enqueues tracks, automatically advances to the next song, and supports track skipping.
 - **Input Sanitization & Process Isolation**: Single-instance mutex on Windows, SSRF prevention on user-supplied URLs, and safe token storage.
 - **Dual Execution Modes**: Interactive CLI mode for manual testing and background daemon mode for production servers.
@@ -23,7 +24,8 @@ The project is completely headless, with no GUI dependencies or local audio devi
 
 | Command | Description |
 |---|---|
-| `/play <query/url>` | Play audio or add to queue |
+| `/join` | Connect bot to your voice channel |
+| `/play <query/url>` | Play audio or add to queue (supports history autocomplete) |
 | `/skip` | Skip the currently playing track |
 | `/pause` | Pause playback |
 | `/resume` | Resume playback |
@@ -120,9 +122,10 @@ echo "DISCORD_BOT_TOKEN=YOUR_BOT_TOKEN" > .env
 chmod 600 .env
 ```
 
-Optional: To enable authenticated session support on headless servers, place an exported Netscape-format `cookies.txt` into the project root:
+> **Note on Cookies**: Cookies are **optional**. Both streaming and downloading work out of the box in guest mode without cookies. If an optional `cookies.txt` is provided and fails or expires, the bot automatically retries in clean guest mode.
+
 ```bash
-# Upload cookies.txt to /home/ubuntu/woeyyy-discord-bot/cookies.txt
+# Optional: place exported Netscape-format cookies.txt in the project root
 chmod 600 cookies.txt
 ```
 
@@ -166,6 +169,7 @@ woeyyy-discord-bot/
 ├── requirements.txt        # Python package dependencies
 ├── run.bat                 # Windows setup and launcher script
 ├── run_bot.bat             # Windows launcher script
+├── run_local.bat           # Windows local streaming launcher script (zero-download)
 ├── woeyyy-bot.service      # Systemd service unit definition
 ├── KNOWN_ISSUES.md         # Environment limitations and known issues
 └── README.md

@@ -638,7 +638,7 @@ class DiscordVoiceBot:
         """Register all slash commands (/) on the bot's command tree."""
         bot = self.client
 
-        @bot.tree.command(name="join", description="Hubungkan bot Woeyyy ke voice channel tempat kamu berada")
+        @bot.tree.command(name="join", description="Connect the bot to your current voice channel")
         async def cmd_join(interaction: discord.Interaction):
             if not interaction.user.voice or not interaction.user.voice.channel:
                 await interaction.response.send_message(
@@ -656,8 +656,8 @@ class DiscordVoiceBot:
                 print(f"[DiscordBot] Error connecting to voice channel: {e}")
                 await interaction.followup.send(f"Failed to connect to voice channel: {e}")
 
-        @bot.tree.command(name="play", description="Putar lagu dari YouTube / YouTube Music atau tambahkan ke antrean")
-        @app_commands.describe(query="Judul lagu, link YouTube, atau link YouTube Music")
+        @bot.tree.command(name="play", description="Play a track from YouTube or add it to the queue")
+        @app_commands.describe(query="Song title, YouTube URL, or YouTube Music URL")
         async def cmd_play(interaction: discord.Interaction, query: str):
             if not interaction.user.voice or not interaction.user.voice.channel:
                 await interaction.response.send_message(
@@ -683,36 +683,39 @@ class DiscordVoiceBot:
             self._notify_status("SEARCHING", "Searching for track...")
 
             requester_name = interaction.user.display_name
-            success, msg, is_queued, track = await self._async_enqueue_or_play(query, requester=requester_name)
+            try:
+                success, msg, is_queued, track = await self._async_enqueue_or_play(query, requester=requester_name)
 
-            if not success:
-                await msg_handle.edit(content=f"Error: {msg}")
-                return
+                if not success:
+                    await msg_handle.edit(content=f"Error: {msg}")
+                    return
 
-            title = track.get("title", query)
-            dur = track.get("duration_str", "Live")
-            uploader = track.get("uploader", "")
-            url = track.get("webpage_url", "")
+                # Record track to user's history immediately upon retrieval
+                if track:
+                    self.record_user_history(interaction.user.id, track)
 
-            link_part = f"**[{title}](<{url}>)**" if url else f"**{title}**"
-            uploader_part = f" by **{uploader}**" if uploader else ""
-            dur_part = f" (`{dur}`)" if dur else ""
+                title = track.get("title", query)
+                dur = track.get("duration_str", "Live")
+                uploader = track.get("uploader", "")
+                url = track.get("webpage_url", "")
 
-            if is_queued:
-                pos = len(self.queue)
-                await msg_handle.edit(
-                    content=f"Added {link_part}{uploader_part}{dur_part} to the queue at position #{pos}.",
-                    suppress=True,
-                )
-            else:
-                await msg_handle.edit(
-                    content=f"Added {link_part}{uploader_part}{dur_part} to begin playing.",
-                    suppress=True,
-                )
+                link_part = f"**[{title}](<{url}>)**" if url else f"**{title}**"
+                uploader_part = f" by **{uploader}**" if uploader else ""
+                dur_part = f" (`{dur}`)" if dur else ""
 
-            # Record track to user's history
-            if track:
-                self.record_user_history(interaction.user.id, track)
+                if is_queued:
+                    pos = len(self.queue)
+                    msg_text = f"Added {link_part}{uploader_part}{dur_part} to the queue at position #{pos}."
+                else:
+                    msg_text = f"Added {link_part}{uploader_part}{dur_part} to begin playing."
+
+                await msg_handle.edit(content=msg_text)
+            except Exception as e:
+                print(f"[DiscordBot] Error during /play command execution: {e}")
+                try:
+                    await msg_handle.edit(content=f"Error: {e}")
+                except Exception:
+                    pass
 
         @cmd_play.autocomplete("query")
         async def play_autocomplete(
@@ -720,11 +723,13 @@ class DiscordVoiceBot:
             current: str,
         ) -> List[app_commands.Choice[str]]:
             clean = current.strip() if current else ""
+            user_id = str(interaction.user.id)
+            history = self.get_user_history(user_id)
 
             if not clean:
-                # Return user's recent history songs (up to 25 items)
-                user_id = str(interaction.user.id)
-                history = self.get_user_history(user_id)
+                if not history:
+                    return []
+
                 choices = []
                 for item in history[:25]:
                     title = item.get("title", "").strip()
@@ -733,21 +738,54 @@ class DiscordVoiceBot:
                         label = f"{uploader} - {title}"
                     else:
                         label = title
-                    name = f"🕒 {label}"
+                    name = label
                     if len(name) > 100:
                         name = name[:97] + "..."
                     val = (item.get("webpage_url") or title)[:100]
                     choices.append(app_commands.Choice(name=name, value=val))
                 return choices
 
-            # When user enters a query, query YouTube suggestions directly (original behavior)
-            suggestions = await self.get_autocomplete_suggestions(clean)
-            return [
-                app_commands.Choice(name=item["name"], value=item["value"])
-                for item in suggestions[:25]
-            ]
+            choices: List[app_commands.Choice[str]] = []
+            seen_values = set()
 
-        @bot.tree.command(name="skip", description="Lewati lagu yang sedang diputar dan putar lagu berikutnya di antrean")
+            # 1. Check matching items from user's history first
+            clean_lower = clean.lower()
+            for item in history:
+                title = item.get("title", "").strip()
+                uploader = item.get("uploader", "").strip()
+                val = (item.get("webpage_url") or title)[:100]
+                if clean_lower in title.lower() or (uploader and clean_lower in uploader.lower()):
+                    if uploader and not title.lower().startswith(uploader.lower()):
+                        label = f"{uploader} - {title}"
+                    else:
+                        label = title
+                    name = label
+                    if len(name) > 100:
+                        name = name[:97] + "..."
+                    if val not in seen_values:
+                        choices.append(app_commands.Choice(name=name, value=val))
+                        seen_values.add(val)
+                        if len(choices) >= 5:
+                            break
+
+            # 2. Fetch live YouTube suggestions for the remaining slots
+            remaining = 25 - len(choices)
+            if remaining > 0:
+                try:
+                    suggestions = await self.get_autocomplete_suggestions(clean)
+                    for item in suggestions:
+                        val = item["value"]
+                        if val not in seen_values:
+                            choices.append(app_commands.Choice(name=item["name"], value=val))
+                            seen_values.add(val)
+                            if len(choices) >= 25:
+                                break
+                except Exception as e:
+                    print(f"[DiscordBot] Autocomplete error: {e}")
+
+            return choices
+
+        @bot.tree.command(name="skip", description="Skip the currently playing track")
         async def cmd_skip(interaction: discord.Interaction):
             if not self.is_playing and not self.is_paused:
                 await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
@@ -776,7 +814,7 @@ class DiscordVoiceBot:
                     f"Skipped **{old_title}**. The queue is now empty."
                 )
 
-        @bot.tree.command(name="queue", description="Lihat daftar antrean lagu yang akan diputar")
+        @bot.tree.command(name="queue", description="Display the current song queue")
         async def cmd_queue(interaction: discord.Interaction):
             if not self.current_track and not self.queue:
                 await interaction.response.send_message("The queue is empty.", ephemeral=True)
@@ -811,12 +849,12 @@ class DiscordVoiceBot:
 
             await interaction.response.send_message("\n".join(lines), suppress_embeds=True)
 
-        @bot.tree.command(name="clear", description="Kosongkan semua antrean lagu yang ada")
+        @bot.tree.command(name="clear", description="Clear all songs from the queue")
         async def cmd_clear(interaction: discord.Interaction):
             count = self.clear_queue()
             await interaction.response.send_message(f"Cleared {count} tracks from the queue.")
 
-        @bot.tree.command(name="pause", description="Pause lagu yang sedang diputar")
+        @bot.tree.command(name="pause", description="Pause the currently playing track")
         async def cmd_pause(interaction: discord.Interaction):
             if self.voice_client and self.voice_client.is_playing():
                 self.voice_client.pause()
@@ -826,7 +864,7 @@ class DiscordVoiceBot:
             else:
                 await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
 
-        @bot.tree.command(name="resume", description="Lanjutkan lagu yang dijeda")
+        @bot.tree.command(name="resume", description="Resume paused playback")
         async def cmd_resume(interaction: discord.Interaction):
             if self.voice_client and self.voice_client.is_paused():
                 self.voice_client.resume()
@@ -836,19 +874,19 @@ class DiscordVoiceBot:
             else:
                 await interaction.response.send_message("Playback is not paused.", ephemeral=True)
 
-        @bot.tree.command(name="stop", description="Hentikan lagu dan bersihkan antrean")
+        @bot.tree.command(name="stop", description="Stop playback and clear the queue")
         async def cmd_stop(interaction: discord.Interaction):
             self.stop_playback()
             await interaction.response.send_message("Playback stopped and queue cleared.")
 
-        @bot.tree.command(name="volume", description="Ubah volume suara bot (0% - 150%)")
-        @app_commands.describe(percentage="Persentase volume (contoh: 100)")
+        @bot.tree.command(name="volume", description="Adjust playback volume (0% - 150%)")
+        @app_commands.describe(percentage="Volume percentage (e.g. 100)")
         async def cmd_volume(interaction: discord.Interaction, percentage: int):
             vol = max(0, min(150, percentage)) / 100.0
             self.set_volume(vol)
             await interaction.response.send_message(f"Volume set to `{percentage}%`.")
 
-        @bot.tree.command(name="leave", description="Keluarkan bot dari Voice Channel")
+        @bot.tree.command(name="leave", description="Disconnect the bot from the voice channel")
         async def cmd_leave(interaction: discord.Interaction):
             guild_vc = getattr(interaction.guild, "voice_client", None) if interaction.guild else None
             if (self.voice_client and self.voice_client.is_connected()) or guild_vc:
@@ -1069,10 +1107,20 @@ class DiscordVoiceBot:
             http_headers = {}
 
             if self.is_local:
-                # Local Mode: Direct Streaming without full file download & without cookies
-                stream_opts = dict(YTDL_OPTIONS)
-                stream_opts.pop("cookiefile", None)
-                stream_opts["noplaylist"] = True
+                # Local Mode: Direct Streaming without full file download & zero cookies required
+                stream_opts = {
+                    "format": "bestaudio/best",
+                    "extractaudio": True,
+                    "audioformat": "opus",
+                    "noplaylist": True,
+                    "nocheckcertificate": False,
+                    "ignoreerrors": False,
+                    "logtostderr": False,
+                    "quiet": True,
+                    "no_warnings": True,
+                    "default_search": "ytsearch1:",
+                    "source_address": "0.0.0.0",
+                }
                 try:
                     ytdl_stream = yt_dlp.YoutubeDL(stream_opts)
                     data = await loop.run_in_executor(
@@ -1113,8 +1161,14 @@ class DiscordVoiceBot:
                 except Exception as dl_err:
                     if "cookiefile" in dl_opts:
                         print(f"[DiscordBot] Download with cookies encountered error ({dl_err}), retrying without cookies...")
-                        dl_opts.pop("cookiefile", None)
-                        ytdl_dl = yt_dlp.YoutubeDL(dl_opts)
+                        clean_dl_opts = {
+                            "format": "bestaudio/best",
+                            "outtmpl": os.path.join(cache_dir, "%(id)s.%(ext)s"),
+                            "noplaylist": True,
+                            "quiet": True,
+                            "source_address": "0.0.0.0",
+                        }
+                        ytdl_dl = yt_dlp.YoutubeDL(clean_dl_opts)
                         data = await loop.run_in_executor(
                             None, lambda: ytdl_dl.extract_info(sanitized_target, download=True)
                         )
@@ -1191,16 +1245,20 @@ class DiscordVoiceBot:
             ffmpeg_bin = get_ffmpeg_binary()
             audio_src = track.get("filepath") or track.get("url")
 
-            # Dynamic refresh for long-queued direct stream URLs (> 2 hours)
             if track.get("is_stream") and track.get("webpage_url"):
                 age = time.time() - track.get("timestamp", 0)
                 if not audio_src or age > 7200:
                     try:
                         loop = asyncio.get_event_loop()
-                        stream_opts = dict(YTDL_OPTIONS)
-                        if self.is_local:
-                            stream_opts.pop("cookiefile", None)
-                        stream_opts["noplaylist"] = True
+                        stream_opts = {
+                            "format": "bestaudio/best",
+                            "extractaudio": True,
+                            "audioformat": "opus",
+                            "noplaylist": True,
+                            "quiet": True,
+                            "no_warnings": True,
+                            "source_address": "0.0.0.0",
+                        }
                         ytdl_refresh = yt_dlp.YoutubeDL(stream_opts)
                         refreshed = await loop.run_in_executor(
                             None, lambda: ytdl_refresh.extract_info(track["webpage_url"], download=False)
@@ -1236,11 +1294,30 @@ class DiscordVoiceBot:
                     options="-vn",
                 )
             transformer = discord.PCMVolumeTransformer(source, volume=self.volume)
+            play_start_time = time.time()
 
             def _after_play(error):
                 actual_error = error
                 if not actual_error and hasattr(source, "_current_error") and source._current_error:
                     actual_error = source._current_error
+
+                # Also inspect process returncode if process terminated with non-zero
+                proc = getattr(source, "_process", None)
+                if proc is not None:
+                    try:
+                        proc_ret = proc.poll()
+                        if proc_ret is None:
+                            proc_ret = proc.wait(timeout=0.5)
+                        if proc_ret is not None and proc_ret != 0:
+                            actual_error = actual_error or f"FFmpeg exited with code {proc_ret}"
+                    except Exception:
+                        pass
+
+                # Also detect premature exit: if a stream stopped in < 3.0s for a song with duration > 10s
+                duration_sec = track.get("duration_sec", 0)
+                elapsed = time.time() - play_start_time
+                if not actual_error and track.get("is_stream") and (duration_sec == 0 or duration_sec > 10) and elapsed < 3.0:
+                    actual_error = f"Stream ended prematurely after {elapsed:.1f}s"
 
                 if actual_error:
                     print(f"[DiscordBot] Playback error: {actual_error}")
@@ -1248,7 +1325,7 @@ class DiscordVoiceBot:
 
                 # If direct stream failed immediately, fallback automatically to download mode
                 if actual_error and track.get("is_stream") and not track.get("_retried_as_download"):
-                    print(f"[DiscordBot] Stream encountered error, falling back to download for: {track.get('title')}")
+                    print(f"[DiscordBot] Stream encountered error ({actual_error}), falling back to download for: {track.get('title')}")
                     track["_retried_as_download"] = True
                     if self._loop and self._loop.is_running():
                         async def _fallback_download():
@@ -1258,10 +1335,28 @@ class DiscordVoiceBot:
                                 dl_opts = dict(YTDL_OPTIONS)
                                 dl_opts["outtmpl"] = os.path.join(cache_dir, "%(id)s.%(ext)s")
                                 dl_opts["noplaylist"] = True
-                                ytdl_dl = yt_dlp.YoutubeDL(dl_opts)
-                                fallback_data = await self._loop.run_in_executor(
-                                    None, lambda: ytdl_dl.extract_info(track["webpage_url"], download=True)
-                                )
+                                try:
+                                    ytdl_dl = yt_dlp.YoutubeDL(dl_opts)
+                                    fallback_data = await self._loop.run_in_executor(
+                                        None, lambda: ytdl_dl.extract_info(track["webpage_url"], download=True)
+                                    )
+                                except Exception as dl_err:
+                                    if "cookiefile" in dl_opts:
+                                        print(f"[DiscordBot] Fallback download with cookies failed ({dl_err}), retrying without cookies...")
+                                        clean_dl_opts = {
+                                            "format": "bestaudio/best",
+                                            "outtmpl": os.path.join(cache_dir, "%(id)s.%(ext)s"),
+                                            "noplaylist": True,
+                                            "quiet": True,
+                                            "source_address": "0.0.0.0",
+                                        }
+                                        ytdl_dl = yt_dlp.YoutubeDL(clean_dl_opts)
+                                        fallback_data = await self._loop.run_in_executor(
+                                            None, lambda: ytdl_dl.extract_info(track["webpage_url"], download=True)
+                                        )
+                                    else:
+                                        raise dl_err
+
                                 if fallback_data and "entries" in fallback_data and fallback_data["entries"]:
                                     fallback_data = fallback_data["entries"][0]
                                 dl_filepath = ytdl_dl.prepare_filename(fallback_data)
