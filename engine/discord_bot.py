@@ -8,6 +8,7 @@ import asyncio
 import html
 import json
 import os
+import queue
 import random
 import re
 import subprocess
@@ -113,6 +114,8 @@ YTDL_OPTIONS = {
     "no_warnings": True,
     "default_search": "ytsearch1:",
     "source_address": "0.0.0.0",
+    "buffersize": 131072,
+    "http_chunk_size": 10485760,
 }
 
 # Automatically bind cookies.txt if present to authenticate with YouTube
@@ -699,6 +702,104 @@ def resolve_song_info(query_or_url: str) -> Tuple[bool, str, str]:
         return False, query_or_url, query_or_url
 
 
+class BufferedAudioSource(discord.AudioSource):
+    """
+    In-memory PCM Jitter Buffer for Discord voice streaming.
+    Decodes audio ahead of real-time into a RAM queue (default: 250 frames = 5.0 seconds),
+    completely isolating Discord AudioPlayer from disk I/O latency, CPU contention,
+    and yt-dlp download spikes during queue additions.
+    """
+
+    def __init__(self, original: discord.AudioSource, buffer_size: int = 250):
+        self.original = original
+        self.buffer_size = buffer_size
+        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=buffer_size)
+        self._stop_event = threading.Event()
+        self._eof = False
+        self._feeder_error: Optional[Exception] = None
+        self._underrun_count = 0
+
+        self._feeder = threading.Thread(
+            target=self._feed,
+            name="AudioBufferFeeder",
+            daemon=True,
+        )
+        self._feeder.start()
+
+        # Prime initial buffer (up to 200ms or 10 frames) so AudioPlayer never starts starved
+        start_wait = time.perf_counter()
+        while self._queue.qsize() < 10 and not self._eof and not self._stop_event.is_set():
+            if time.perf_counter() - start_wait > 0.2:
+                break
+            time.sleep(0.01)
+
+    def _feed(self):
+        """Continuously read PCM frames from original source and buffer in memory."""
+        try:
+            while not self._stop_event.is_set():
+                data = self.original.read()
+                if not data:
+                    self._eof = True
+                    break
+                while not self._stop_event.is_set():
+                    try:
+                        self._queue.put(data, timeout=0.05)
+                        break
+                    except queue.Full:
+                        continue
+        except Exception as e:
+            self._feeder_error = e
+        finally:
+            self._eof = True
+
+    def read(self) -> bytes:
+        """
+        Return next 20ms audio frame instantly from RAM.
+        Never blocks on FFmpeg or disk I/O.
+        """
+        while not self._stop_event.is_set():
+            if self._eof and self._queue.empty():
+                return b""
+            try:
+                data = self._queue.get(timeout=0.02)
+                self._underrun_count = 0
+                return data
+            except queue.Empty:
+                if self._eof and self._queue.empty():
+                    return b""
+                self._underrun_count += 1
+                if self._underrun_count > 150:  # 3 seconds of complete source stall
+                    return b""
+                # Underrun safety: return 20ms silence frame (3840 bytes) rather than clicking or crashing
+                return b"\x00" * 3840
+        return b""
+
+    def is_opus(self) -> bool:
+        return self.original.is_opus()
+
+    def cleanup(self):
+        """Stop feeder thread, drain queue, and clean up underlying source."""
+        self._stop_event.set()
+        try:
+            while not self._queue.empty():
+                self._queue.get_nowait()
+        except Exception:
+            pass
+        if hasattr(self.original, "cleanup"):
+            try:
+                self.original.cleanup()
+            except Exception:
+                pass
+
+    @property
+    def _process(self):
+        return getattr(self.original, "_process", None)
+
+    @property
+    def _current_error(self):
+        return getattr(self.original, "_current_error", None) or self._feeder_error
+
+
 class DiscordVoiceBot:
     """
     Thread-safe Discord bot controller with queue and slash commands.
@@ -740,7 +841,7 @@ class DiscordVoiceBot:
         self.ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
         self.user_history: Dict[str, List[Dict[str, any]]] = load_user_history()
         self._history_lock = threading.Lock()
-        prune_audio_cache(AUDIO_CACHE_DIR)
+        threading.Thread(target=prune_audio_cache, args=(AUDIO_CACHE_DIR,), daemon=True).start()
 
     def record_user_history(self, user_id: Union[int, str], track: Dict[str, any]):
         """Record a played/enqueued song to user history (max 25 songs, FIFO with deduplication)."""
@@ -770,7 +871,9 @@ class DiscordVoiceBot:
             ]
             new_list = [entry] + filtered
             self.user_history[uid] = new_list[:25]
-            save_user_history(self.user_history)
+            hist_copy = {k: list(v) for k, v in self.user_history.items()}
+
+        threading.Thread(target=save_user_history, args=(hist_copy,), daemon=True).start()
 
     def get_user_history(self, user_id: Union[int, str]) -> List[Dict[str, any]]:
         """Get copy of user song history."""
@@ -784,8 +887,10 @@ class DiscordVoiceBot:
         with self._history_lock:
             count = len(self.user_history.get(uid, []))
             self.user_history.pop(uid, None)
-            save_user_history(self.user_history)
-            return count
+            hist_copy = {k: list(v) for k, v in self.user_history.items()}
+
+        threading.Thread(target=save_user_history, args=(hist_copy,), daemon=True).start()
+        return count
 
     async def _get_http_session(self) -> aiohttp.ClientSession:
         """Get or lazily create a persistent aiohttp.ClientSession for the bot loop."""
@@ -1525,6 +1630,8 @@ class DiscordVoiceBot:
                             "noplaylist": True,
                             "quiet": True,
                             "source_address": "0.0.0.0",
+                            "buffersize": 131072,
+                            "http_chunk_size": 10485760,
                         }
                         ytdl_dl = yt_dlp.YoutubeDL(clean_dl_opts)
                         data = await loop.run_in_executor(
@@ -1578,22 +1685,22 @@ class DiscordVoiceBot:
                 "emoji": emoji,
             }
 
-            # Save metadata and enforce storage limits
+            # Save metadata and enforce storage limits asynchronously to eliminate event loop lag
             target_vid = data.get("id") or vid_id or extract_youtube_video_id(data.get("webpage_url", ""))
             if target_vid and filepath and os.path.exists(filepath):
-                save_track_cache_meta(
-                    cache_dir,
-                    target_vid,
-                    {
-                        "title": title,
-                        "uploader": uploader,
-                        "duration_sec": sec,
-                        "duration_str": dur_str,
-                        "webpage_url": data.get("webpage_url", f"https://www.youtube.com/watch?v={target_vid}"),
-                        "video_id": target_vid,
-                    },
-                )
-                prune_audio_cache(cache_dir)
+                meta_dict = {
+                    "title": title,
+                    "uploader": uploader,
+                    "duration_sec": sec,
+                    "duration_str": dur_str,
+                    "webpage_url": data.get("webpage_url", f"https://www.youtube.com/watch?v={target_vid}"),
+                    "video_id": target_vid,
+                }
+                def _bg_persist():
+                    save_track_cache_meta(cache_dir, target_vid, meta_dict)
+                    prune_audio_cache(cache_dir)
+
+                loop.run_in_executor(None, _bg_persist)
 
             # Check if playback is currently active
             if self.is_playing or self.is_paused:
@@ -1675,7 +1782,8 @@ class DiscordVoiceBot:
                     before_options=before_opts,
                     options="-vn -threads 1",
                 )
-            transformer = discord.PCMVolumeTransformer(source, volume=self.volume)
+            buffered_source = BufferedAudioSource(source, buffer_size=250)
+            transformer = discord.PCMVolumeTransformer(buffered_source, volume=self.volume)
             play_start_time = time.time()
 
             def _after_play(error):
@@ -1731,6 +1839,8 @@ class DiscordVoiceBot:
                                             "noplaylist": True,
                                             "quiet": True,
                                             "source_address": "0.0.0.0",
+                                            "buffersize": 131072,
+                                            "http_chunk_size": 10485760,
                                         }
                                         ytdl_dl = yt_dlp.YoutubeDL(clean_dl_opts)
                                         fallback_data = await self._loop.run_in_executor(
@@ -1754,19 +1864,21 @@ class DiscordVoiceBot:
                                     track["is_stream"] = False
                                     fb_vid = fallback_data.get("id") or extract_youtube_video_id(track.get("webpage_url", ""))
                                     if fb_vid:
-                                        save_track_cache_meta(
-                                            cache_dir,
-                                            fb_vid,
-                                            {
-                                                "title": track.get("title", fb_vid),
-                                                "uploader": track.get("uploader", ""),
-                                                "duration_sec": track.get("duration_sec", 0),
-                                                "duration_str": track.get("duration_str", ""),
-                                                "webpage_url": track.get("webpage_url", f"https://www.youtube.com/watch?v={fb_vid}"),
-                                                "video_id": fb_vid,
-                                            },
-                                        )
-                                        prune_audio_cache(cache_dir)
+                                        fb_meta = {
+                                            "title": track.get("title", fb_vid),
+                                            "uploader": track.get("uploader", ""),
+                                            "duration_sec": track.get("duration_sec", 0),
+                                            "duration_str": track.get("duration_str", ""),
+                                            "webpage_url": track.get("webpage_url", f"https://www.youtube.com/watch?v={fb_vid}"),
+                                            "video_id": fb_vid,
+                                        }
+                                        threading.Thread(
+                                            target=lambda: (
+                                                save_track_cache_meta(cache_dir, fb_vid, fb_meta),
+                                                prune_audio_cache(cache_dir),
+                                            ),
+                                            daemon=True,
+                                        ).start()
                                     await self._async_play_track(track)
                                     return
                             except Exception as dl_err:
@@ -1782,7 +1894,7 @@ class DiscordVoiceBot:
                     except OSError:
                         pass
                     cache_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cache"))
-                    prune_audio_cache(cache_dir)
+                    threading.Thread(target=prune_audio_cache, args=(cache_dir,), daemon=True).start()
 
                 # Check if there are songs waiting in the queue
                 if self.queue and self.voice_client and self.voice_client.is_connected():

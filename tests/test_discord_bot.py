@@ -11,6 +11,7 @@ import unittest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from engine.discord_bot import (
+    BufferedAudioSource,
     DiscordVoiceBot,
     FFMPEG_EXECUTABLE,
     load_saved_token,
@@ -585,6 +586,79 @@ class TestDiscordVoiceBot(unittest.TestCase):
 
                 self.assertEqual(max_bytes, 350 * 1024 * 1024)
                 self.assertEqual(max_files, 25)
+
+    def test_buffered_audio_source_lifecycle(self):
+        """Verify BufferedAudioSource buffers audio frames, proxies properties, and terminates on EOF."""
+        import discord
+
+        class MockSource(discord.AudioSource):
+            def __init__(self, count=15):
+                self.count = count
+                self.cleaned = False
+                self._process = "mock_proc"
+                self._current_error = None
+
+            def read(self):
+                if self.count <= 0:
+                    return b""
+                self.count -= 1
+                return b"A" * 3840
+
+            def cleanup(self):
+                self.cleaned = True
+
+        mock_src = MockSource(15)
+        buffered = BufferedAudioSource(mock_src, buffer_size=20)
+        self.assertEqual(buffered._process, "mock_proc")
+        self.assertFalse(buffered.is_opus())
+
+        frames = []
+        while True:
+            frame = buffered.read()
+            if not frame:
+                break
+            frames.append(frame)
+
+        self.assertEqual(len(frames), 15)
+        self.assertEqual(frames[0], b"A" * 3840)
+        buffered.cleanup()
+        self.assertTrue(mock_src.cleaned)
+
+    def test_buffered_audio_source_with_volume_transformer(self):
+        """Verify BufferedAudioSource integrates seamlessly with discord.PCMVolumeTransformer."""
+        import discord
+
+        class MockSource(discord.AudioSource):
+            def __init__(self):
+                self.frames = [b"\x10\x00" * 1920, b""]
+            def read(self):
+                return self.frames.pop(0) if self.frames else b""
+            def cleanup(self):
+                pass
+
+        buffered = BufferedAudioSource(MockSource(), buffer_size=10)
+        transformer = discord.PCMVolumeTransformer(buffered, volume=0.5)
+        out = transformer.read()
+        self.assertEqual(len(out), 3840)
+        transformer.cleanup()
+
+    def test_buffered_audio_source_underrun_silence(self):
+        """Verify BufferedAudioSource returns silence frames on temporary starvation without premature EOF."""
+        import discord
+
+        class StarvedSource(discord.AudioSource):
+            def __init__(self):
+                self.read_calls = 0
+            def read(self):
+                self.read_calls += 1
+                import time
+                time.sleep(0.08)
+                return b"B" * 3840 if self.read_calls <= 2 else b""
+
+        buffered = BufferedAudioSource(StarvedSource(), buffer_size=10)
+        frame = buffered.read()
+        self.assertEqual(len(frame), 3840)
+        buffered.cleanup()
 
 
 if __name__ == "__main__":
