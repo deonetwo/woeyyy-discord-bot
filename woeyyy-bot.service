@@ -9,9 +9,9 @@ User=ubuntu
 WorkingDirectory=/home/ubuntu/woeyyy-discord-bot
 Environment=PYTHONUNBUFFERED=1
 # Option A: specify token via environment variable
-Environment=DISCORD_BOT_TOKEN=YOUR_BOT_TOKEN_HERE
-# Option B: or read token from .env file
-# EnvironmentFile=/home/ubuntu/woeyyy-discord-bot/.env
+# Environment=DISCORD_BOT_TOKEN=YOUR_BOT_TOKEN_HERE
+# Option B: or read token from .env file (recommended)
+EnvironmentFile=/home/ubuntu/woeyyy-discord-bot/.env
 ExecStart=/home/ubuntu/woeyyy-discord-bot/venv/bin/python main.py --daemon
 Restart=always
 RestartSec=5

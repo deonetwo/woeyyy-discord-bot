@@ -101,7 +101,7 @@ sudo apt update && sudo apt install -y python3 python3-pip python3-venv git ffmp
 
 #### 2. Project Setup
 ```bash
-git clone https://github.com/dewanto-ar/woeyyy-discord-bot.git
+git clone https://github.com/deonetwo/woeyyy-discord-bot.git
 cd woeyyy-discord-bot
 
 python3 -m venv venv
@@ -109,14 +109,18 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+
 #### 3. Token Configuration
-Create a `.env` file:
+Create a `.env` file with your bot token:
 ```bash
 echo "DISCORD_BOT_TOKEN=YOUR_BOT_TOKEN" > .env
+chmod 600 .env
 ```
 
 #### 4. Running with Systemd
+The included `woeyyy-bot.service` loads the bot token directly from `.env` via `EnvironmentFile`:
 ```bash
+# If your user or directory differs from /home/ubuntu/woeyyy-discord-bot, adjust paths in woeyyy-bot.service first
 sudo cp woeyyy-bot.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now woeyyy-bot

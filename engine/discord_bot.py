@@ -285,13 +285,15 @@ CONFIG_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".bo
 def load_saved_token() -> str:
     """
     Load Discord Bot Token with the following priority:
-    1. OS Environment variable: DISCORD_BOT_TOKEN
+    1. OS Environment variable: DISCORD_BOT_TOKEN (ignores placeholder values)
     2. Local .env file
     3. Legacy .bot_config.json (auto-migrates to .env)
     """
+    placeholder_tokens = {"YOUR_BOT_TOKEN_HERE", "YOUR_BOT_TOKEN", ""}
+
     # 1. Check OS Environment variable
-    tok = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
-    if tok:
+    tok = os.environ.get("DISCORD_BOT_TOKEN", "").strip().strip("\"'")
+    if tok and tok not in placeholder_tokens:
         return tok
 
     # 2. Check local .env file
@@ -304,7 +306,7 @@ def load_saved_token() -> str:
                         continue
                     if line.startswith("DISCORD_BOT_TOKEN="):
                         val = line.split("=", 1)[1].strip().strip("\"'")
-                        if val:
+                        if val and val not in placeholder_tokens:
                             os.environ["DISCORD_BOT_TOKEN"] = val
                             return val
         except Exception:
