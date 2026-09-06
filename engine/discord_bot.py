@@ -153,6 +153,71 @@ def get_random_server_emoji(guild: Optional[discord.Guild]) -> str:
     return random.choice(["🎵", "🎶", "🎧", "✨"])
 
 
+def to_unicode_bold(text: str) -> str:
+    """Convert ASCII alphanumeric characters into Unicode Mathematical Sans-Serif Bold."""
+    if not text:
+        return ""
+    res = []
+    for ch in text:
+        code = ord(ch)
+        if 65 <= code <= 90:
+            res.append(chr(0x1D5D4 + (code - 65)))
+        elif 97 <= code <= 122:
+            res.append(chr(0x1D5EE + (code - 97)))
+        elif 48 <= code <= 57:
+            res.append(chr(0x1D7EC + (code - 48)))
+        else:
+            res.append(ch)
+    return "".join(res)
+
+
+def clean_artist_name(uploader: str) -> str:
+    """Clean up auto-generated YouTube artist names like 'Artist - Topic'."""
+    if not uploader:
+        return ""
+    u = uploader.strip()
+    if u.endswith(" - Topic"):
+        u = u[:-8].strip()
+    return u
+
+
+def format_now_playing_status(emoji: str, title: str, uploader: str = "") -> str:
+    """Format voice channel status as: {emoji} Now Playing: {bold_title} • {bold_uploader}."""
+    prefix = f"{emoji} " if emoji else ""
+    t_clean = (title or "Music").strip()
+    u_clean = clean_artist_name(uploader)
+
+    t_bold = to_unicode_bold(t_clean)
+    u_bold = to_unicode_bold(u_clean)
+
+    if u_clean and not t_clean.lower().startswith(u_clean.lower()):
+        text = f"{prefix}Now Playing: {t_bold} • {u_bold}"
+    else:
+        text = f"{prefix}Now Playing: {t_bold}"
+
+    if len(text) > 100:
+        text = text[:97] + "..."
+    return text
+
+
+def format_paused_status(title: str, uploader: str = "") -> str:
+    """Format voice channel status when paused as: ⏸️ Paused: {bold_title} • {bold_uploader}."""
+    t_clean = (title or "Music").strip()
+    u_clean = clean_artist_name(uploader)
+
+    t_bold = to_unicode_bold(t_clean)
+    u_bold = to_unicode_bold(u_clean)
+
+    if u_clean and not t_clean.lower().startswith(u_clean.lower()):
+        text = f"⏸️ Paused: {t_bold} • {u_bold}"
+    else:
+        text = f"⏸️ Paused: {t_bold}"
+
+    if len(text) > 100:
+        text = text[:97] + "..."
+    return text
+
+
 async def async_search_youtube_suggestions(
     query: str,
     session: Optional[aiohttp.ClientSession] = None,
@@ -618,7 +683,32 @@ class DiscordVoiceBot:
         self.is_in_voice = True
         self.current_channel_id = channel.id
         self._notify_status("VOICE_CONNECTED", channel.name)
+        if not self.is_playing and not self.is_paused:
+            await self._update_voice_channel_status("Waiting for song requests", channel_id=channel.id)
         return vc
+
+    async def _update_voice_channel_status(self, status: Optional[str], channel_id: Optional[int] = None):
+        """
+        Update Discord Voice Channel Status (text displayed under voice channel name).
+        Gracefully handles missing permissions ('Set Voice Channel Status').
+        """
+        target_id = channel_id or self.current_channel_id
+        if not target_id and self.voice_client and self.voice_client.channel:
+            target_id = self.voice_client.channel.id
+
+        if not target_id or not self.client:
+            return
+
+        try:
+            if hasattr(self.client, "http") and hasattr(self.client.http, "edit_voice_channel_status"):
+                await self.client.http.edit_voice_channel_status(status, channel_id=target_id)
+            else:
+                ch = self.client.get_channel(target_id)
+                if ch and isinstance(ch, discord.VoiceChannel):
+                    await ch.edit(status=status)
+        except Exception as e:
+            # Requires 'Set Voice Channel Status' permission
+            print(f"[DiscordBot] Notice: could not update voice channel status: {e}")
 
     def _notify_status(self, status: str, detail: str = ""):
         """Notify GUI thread of connection/voice status update."""
@@ -693,8 +783,11 @@ class DiscordVoiceBot:
             self._notify_status("SEARCHING", "Searching for track...")
 
             requester_name = interaction.user.display_name
+            chosen_emoji = get_random_server_emoji(interaction.guild)
             try:
-                success, msg, is_queued, track = await self._async_enqueue_or_play(query, requester=requester_name)
+                success, msg, is_queued, track = await self._async_enqueue_or_play(
+                    query, requester=requester_name, emoji=chosen_emoji
+                )
 
                 if not success:
                     await msg_handle.edit(content=f"Error: {msg}")
@@ -713,7 +806,7 @@ class DiscordVoiceBot:
                 uploader_part = f" by **{uploader}**" if uploader else ""
                 dur_part = f" (`{dur}`)" if dur else ""
 
-                emoji = get_random_server_emoji(interaction.guild)
+                emoji = track.get("emoji") or chosen_emoji
                 prefix = f"{emoji} " if emoji else ""
 
                 if is_queued:
@@ -818,8 +911,8 @@ class DiscordVoiceBot:
                 next_up = f" by **{next_uploader}**" if next_uploader else ""
                 next_dur_part = f" (`{next_dur}`)" if next_dur else ""
 
-                emoji = get_random_server_emoji(interaction.guild)
-                prefix = f"{emoji} " if emoji else ""
+                next_emoji = (next_track.get("emoji") if next_track else None) or get_random_server_emoji(interaction.guild)
+                prefix = f"{next_emoji} " if next_emoji else ""
 
                 await interaction.response.send_message(
                     f"{prefix}Skipped **{old_title}**.\nNow playing {next_link}{next_up}{next_dur_part}.",
@@ -847,8 +940,8 @@ class DiscordVoiceBot:
                 cur_up = f" by **{c_up}**" if c_up else ""
                 cur_dur = f" (`{c_dur}`)" if c_dur else ""
 
-                emoji = get_random_server_emoji(interaction.guild)
-                prefix = f"{emoji} " if emoji else ""
+                cur_emoji = (self.current_track.get("emoji") if self.current_track else None) or get_random_server_emoji(interaction.guild)
+                prefix = f"{cur_emoji} " if cur_emoji else ""
                 lines.append(f"{prefix}Now playing: {cur_link}{cur_up}{cur_dur}")
 
             if self.queue:
@@ -862,7 +955,9 @@ class DiscordVoiceBot:
                     t_link = f"**[{t_title}](<{t_url}>)**" if t_url else f"**{t_title}**"
                     t_up_part = f" by **{t_up}**" if t_up else ""
                     t_dur_part = f" (`{t_dur}`)" if t_dur else ""
-                    lines.append(f"`{i}.` {t_link}{t_up_part}{t_dur_part}")
+                    t_emoji = t.get("emoji")
+                    t_prefix = f"{t_emoji} " if t_emoji else ""
+                    lines.append(f"`{i}.` {t_prefix}{t_link}{t_up_part}{t_dur_part}")
                 if len(self.queue) > 10:
                     lines.append(f"... and {len(self.queue) - 10} more tracks.")
 
@@ -876,9 +971,7 @@ class DiscordVoiceBot:
         @bot.tree.command(name="pause", description="Pause the currently playing track")
         async def cmd_pause(interaction: discord.Interaction):
             if self.voice_client and self.voice_client.is_playing():
-                self.voice_client.pause()
-                self.is_paused = True
-                self._notify_status("PAUSED", self.current_title)
+                self.pause()
                 await interaction.response.send_message("Playback paused.")
             else:
                 await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
@@ -886,9 +979,7 @@ class DiscordVoiceBot:
         @bot.tree.command(name="resume", description="Resume paused playback")
         async def cmd_resume(interaction: discord.Interaction):
             if self.voice_client and self.voice_client.is_paused():
-                self.voice_client.resume()
-                self.is_paused = False
-                self._notify_status("PLAYING", self.current_title)
+                self.resume()
                 await interaction.response.send_message("Playback resumed.")
             else:
                 await interaction.response.send_message("Playback is not paused.", ephemeral=True)
@@ -951,6 +1042,8 @@ class DiscordVoiceBot:
         async def on_voice_state_update(member, before, after):
             if member == self.client.user:
                 if after.channel is None:
+                    old_cid = self.current_channel_id or (before.channel.id if before and before.channel else None)
+                    await self._update_voice_channel_status(None, channel_id=old_cid)
                     self.is_in_voice = False
                     if before and before.channel and hasattr(before.channel, "guild"):
                         g_vc = getattr(before.channel.guild, "voice_client", None)
@@ -967,6 +1060,8 @@ class DiscordVoiceBot:
                     self.current_channel_id = after.channel.id
                     self.voice_client = getattr(after.channel.guild, "voice_client", None)
                     self._notify_status("VOICE_CONNECTED", after.channel.name)
+                    if not self.is_playing and not self.is_paused:
+                        await self._update_voice_channel_status("Waiting for song requests", channel_id=after.channel.id)
 
         try:
             self._loop.run_until_complete(self.client.start(token))
@@ -1068,6 +1163,8 @@ class DiscordVoiceBot:
             return
 
         async def _async_leave():
+            old_cid = self.current_channel_id
+            await self._update_voice_channel_status(None, channel_id=old_cid)
             vc = self.voice_client
             if not vc and self.client and self.current_channel_id:
                 ch = self.client.get_channel(self.current_channel_id)
@@ -1100,7 +1197,7 @@ class DiscordVoiceBot:
 
         asyncio.run_coroutine_threadsafe(_async_leave(), self._loop)
 
-    async def _async_enqueue_or_play(self, query_or_url: str, requester: str = "Host") -> Tuple[bool, str, bool, Dict[str, any]]:
+    async def _async_enqueue_or_play(self, query_or_url: str, requester: str = "Host", emoji: str = "") -> Tuple[bool, str, bool, Dict[str, any]]:
         """
         Extract stream info using yt-dlp with YouTube Music normalization.
         When is_local=True: Uses direct streaming (download=False) without cookies for instant playback.
@@ -1220,6 +1317,10 @@ class DiscordVoiceBot:
             sec = data.get("duration", 0) or 0
             dur_str = f"{sec // 60}:{sec % 60:02d}" if sec else "Live"
 
+            if not emoji:
+                guild = getattr(self.voice_client, "guild", None) if self.voice_client else None
+                emoji = get_random_server_emoji(guild)
+
             track = {
                 "filepath": filepath,
                 "url": direct_url,
@@ -1232,6 +1333,7 @@ class DiscordVoiceBot:
                 "http_headers": http_headers or data.get("http_headers", {}),
                 "is_stream": filepath is None,
                 "timestamp": time.time(),
+                "emoji": emoji,
             }
 
             # Check if playback is currently active
@@ -1417,12 +1519,23 @@ class DiscordVoiceBot:
                     self.current_title = "No audio playing"
                     self._notify_status("PLAYBACK_STOPPED", "")
                     self._notify_status("QUEUE_UPDATED", "")
+                    if self._loop and self._loop.is_running():
+                        asyncio.run_coroutine_threadsafe(
+                            self._update_voice_channel_status("Waiting for song requests"), self._loop
+                        )
 
             self.voice_client.play(transformer, after=_after_play)
             self.is_playing = True
             self.is_paused = False
             self._notify_status("PLAYING", track["title"])
             self._notify_status("QUEUE_UPDATED", "")
+
+            # Update voice channel status (text under voice channel name)
+            emoji = track.get("emoji") or get_random_server_emoji(self.voice_client.guild if self.voice_client else None)
+            title = track.get("title", "Music")
+            uploader = track.get("uploader", "")
+            status_text = format_now_playing_status(emoji, title, uploader)
+            await self._update_voice_channel_status(status_text)
         except discord.opus.OpusNotLoaded:
             err_msg = "Opus library not found. Run: sudo apt install -y libopus0 libopus-dev"
             print(f"[DiscordBot] {err_msg}")
@@ -1480,6 +1593,11 @@ class DiscordVoiceBot:
             self.voice_client.pause()
             self.is_paused = True
             self._notify_status("PAUSED", self.current_title)
+            if self._loop and self._loop.is_running():
+                title = self.current_track.get("title", self.current_title) if self.current_track else self.current_title
+                uploader = self.current_track.get("uploader", "") if self.current_track else ""
+                status_text = format_paused_status(title, uploader)
+                asyncio.run_coroutine_threadsafe(self._update_voice_channel_status(status_text), self._loop)
 
     def resume(self):
         """Resume paused playback."""
@@ -1487,6 +1605,12 @@ class DiscordVoiceBot:
             self.voice_client.resume()
             self.is_paused = False
             self._notify_status("PLAYING", self.current_title)
+            if self._loop and self._loop.is_running():
+                emoji = (self.current_track.get("emoji") if self.current_track else None) or get_random_server_emoji(self.voice_client.guild if self.voice_client else None)
+                title = self.current_track.get("title", self.current_title) if self.current_track else self.current_title
+                uploader = self.current_track.get("uploader", "") if self.current_track else ""
+                status_text = format_now_playing_status(emoji, title, uploader)
+                asyncio.run_coroutine_threadsafe(self._update_voice_channel_status(status_text), self._loop)
 
     def stop_playback(self):
         """Stop current audio playback and clear queue."""
@@ -1499,6 +1623,10 @@ class DiscordVoiceBot:
         self.current_title = "No audio playing"
         self._notify_status("PLAYBACK_STOPPED", "")
         self._notify_status("QUEUE_UPDATED", "")
+        if self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                self._update_voice_channel_status("Waiting for song requests"), self._loop
+            )
 
     def set_volume(self, volume: float):
         """Update playback volume (0.0 to 1.5)."""

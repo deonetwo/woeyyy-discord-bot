@@ -12,6 +12,7 @@ The project is completely headless, with no GUI dependencies or local audio devi
 
 - **Direct Voice Streaming**: Plays 48kHz stereo Opus audio directly into Discord voice channels.
 - **YouTube and YouTube Music**: Supports search queries, regular YouTube links, and `music.youtube.com` URL normalization.
+- **Voice Channel Status**: Dynamically displays the currently playing track and emoji under the voice channel name.
 - **Slash Commands & Autocomplete**: Autocomplete suggestions appear in chat when typing `/play`, prioritizing your recent playback history.
 - **Stream Auto-Recovery**: Automatically detects premature stream termination and falls back to cached download.
 - **Queue Management**: Enqueues tracks, automatically advances to the next song, and supports track skipping.
@@ -56,7 +57,7 @@ When running interactively (`python main.py`):
 3. Under **Privileged Gateway Intents**, enable **Message Content Intent** and save changes.
 4. Go to **OAuth2 -> URL Generator**:
    - Under **Scopes**, select `bot` and `applications.commands`.
-   - Under **Bot Permissions**, select `Send Messages`, `Read Message History`, `Embed Links`, `Connect`, `Speak`, and `Use Voice Activity`.
+   - Under **Bot Permissions**, select `Send Messages`, `Read Message History`, `Embed Links`, `Connect`, `Speak`, `Use Voice Activity`, and `Set Voice Channel Status`.
 5. Copy the generated URL, open it in a browser, and invite the bot to your server.
 
 ## Installation and Usage

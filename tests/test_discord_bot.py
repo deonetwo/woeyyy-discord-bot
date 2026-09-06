@@ -411,6 +411,63 @@ class TestDiscordVoiceBot(unittest.TestCase):
         picked = get_random_server_emoji(mock_guild)
         self.assertIn(picked, ["<:pepejam:111222333>", "<a:blobdance:444555666>"])
 
+    def test_update_voice_channel_status(self):
+        """Test _update_voice_channel_status calls http.edit_voice_channel_status and handles errors gracefully."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        bot = DiscordVoiceBot()
+        bot.client = MagicMock()
+        bot.client.http = MagicMock()
+        bot.client.http.edit_voice_channel_status = AsyncMock()
+
+        # 1. Successful update
+        bot.current_channel_id = 123456789
+        asyncio.run(bot._update_voice_channel_status("🎵 Testing Song"))
+        bot.client.http.edit_voice_channel_status.assert_called_with("🎵 Testing Song", channel_id=123456789)
+
+        # 2. Resilient against permission errors (Forbidden)
+        bot.client.http.edit_voice_channel_status.side_effect = Exception("Missing Permissions: Set Voice Channel Status")
+        # Should not raise
+        try:
+            asyncio.run(bot._update_voice_channel_status("🎵 Error Case"))
+        except Exception:
+            self.fail("_update_voice_channel_status raised an exception when permission was denied")
+
+    def test_format_now_playing_status(self):
+        """Test format_now_playing_status formats with clean bullet style and strips - Topic with bold unicode."""
+        from engine.discord_bot import format_now_playing_status, format_paused_status, clean_artist_name, to_unicode_bold
+
+        # 1. Clean - Topic from artist
+        self.assertEqual(clean_artist_name("Hoi Festa - Topic"), "Hoi Festa")
+        self.assertEqual(clean_artist_name("Coldplay"), "Coldplay")
+        self.assertEqual(clean_artist_name(""), "")
+
+        # 2. Unicode bold helper
+        self.assertEqual(to_unicode_bold("Asuka 123"), "𝗔𝘀𝘂𝗸𝗮 𝟭𝟮𝟯")
+
+        # 3. Title and artist with bullet and bold
+        res = format_now_playing_status("🎶", "Asuka", "Hoi Festa - Topic")
+        self.assertEqual(res, "🎶 Now Playing: 𝗔𝘀𝘂𝗸𝗮 • 𝗛𝗼𝗶 𝗙𝗲𝘀𝘁𝗮")
+
+        # 4. Avoid duplicating artist if already in title
+        res2 = format_now_playing_status("🎵", "Coldplay - Yellow", "Coldplay")
+        self.assertEqual(res2, "🎵 Now Playing: 𝗖𝗼𝗹𝗱𝗽𝗹𝗮𝘆 - 𝗬𝗲𝗹𝗹𝗼𝘄")
+
+        # 5. Without artist
+        res3 = format_now_playing_status("🎧", "Unknown Beat", "")
+        self.assertEqual(res3, "🎧 Now Playing: 𝗨𝗻𝗸𝗻𝗼𝘄𝗻 𝗕𝗲𝗮𝘁")
+
+        # 6. Paused format
+        res_pause = format_paused_status("Asuka", "Hoi Festa - Topic")
+        self.assertEqual(res_pause, "⏸️ Paused: 𝗔𝘀𝘂𝗸𝗮 • 𝗛𝗼𝗶 𝗙𝗲𝘀𝘁𝗮")
+
+        # 7. Long title is clamped to <= 100
+        long_title = "A" * 120
+        res4 = format_now_playing_status("🎵", long_title, "Artist")
+        self.assertLessEqual(len(res4), 100)
+        self.assertTrue(res4.endswith("..."))
+
 
 if __name__ == "__main__":
     unittest.main()
