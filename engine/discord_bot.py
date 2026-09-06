@@ -579,7 +579,7 @@ class DiscordVoiceBot:
 
             try:
                 await self._ensure_voice_connected(channel)
-                await interaction.followup.send(f"Connected to `#{channel.name}`.")
+                await interaction.followup.send(f"Connected to **#{channel.name}**")
             except Exception as e:
                 print(f"[DiscordBot] Error connecting to voice channel: {e}")
                 await interaction.followup.send(f"Failed to connect to voice channel: {e}")
@@ -622,18 +622,20 @@ class DiscordVoiceBot:
             uploader = track.get("uploader", "")
             url = track.get("webpage_url", "")
 
-            link_part = f"[{title}]({url})" if url else f"**{title}**"
+            link_part = f"**[{title}](<{url}>)**" if url else f"**{title}**"
             uploader_part = f" by **{uploader}**" if uploader else ""
-            dur_part = f" (` {dur} `)" if dur else ""
+            dur_part = f" (`{dur}`)" if dur else ""
 
             if is_queued:
                 pos = len(self.queue)
                 await msg_handle.edit(
-                    content=f"Added {link_part}{uploader_part}{dur_part} to the queue at position #{pos}."
+                    content=f"Added {link_part}{uploader_part}{dur_part} to the queue at position #{pos}.",
+                    suppress=True,
                 )
             else:
                 await msg_handle.edit(
-                    content=f"Added {link_part}{uploader_part}{dur_part} to begin playing."
+                    content=f"Added {link_part}{uploader_part}{dur_part} to begin playing.",
+                    suppress=True,
                 )
 
         @cmd_play.autocomplete("query")
@@ -666,12 +668,13 @@ class DiscordVoiceBot:
                 next_dur = next_track.get("duration_str", "Live")
                 next_uploader = next_track.get("uploader", "")
 
-                next_link = f"[{next_title}]({next_url})" if next_url else f"**{next_title}**"
+                next_link = f"**[{next_title}](<{next_url}>)**" if next_url else f"**{next_title}**"
                 next_up = f" by **{next_uploader}**" if next_uploader else ""
-                next_dur_part = f" (` {next_dur} `)" if next_dur else ""
+                next_dur_part = f" (`{next_dur}`)" if next_dur else ""
 
                 await interaction.response.send_message(
-                    f"Skipped **{old_title}**.\nNow playing {next_link}{next_up}{next_dur_part}."
+                    f"Skipped **{old_title}**.\nNow playing {next_link}{next_up}{next_dur_part}.",
+                    suppress_embeds=True,
                 )
             else:
                 await interaction.response.send_message(
@@ -691,9 +694,9 @@ class DiscordVoiceBot:
                 c_dur = self.current_track.get("duration_str", "Live")
                 c_up = self.current_track.get("uploader", "")
 
-                cur_link = f"[{c_title}]({c_url})" if c_url else f"**{c_title}**"
+                cur_link = f"**[{c_title}](<{c_url}>)**" if c_url else f"**{c_title}**"
                 cur_up = f" by **{c_up}**" if c_up else ""
-                cur_dur = f" (` {c_dur} `)" if c_dur else ""
+                cur_dur = f" (`{c_dur}`)" if c_dur else ""
                 lines.append(f"Now playing: {cur_link}{cur_up}{cur_dur}")
 
             if self.queue:
@@ -704,14 +707,14 @@ class DiscordVoiceBot:
                     t_dur = t.get("duration_str", "Live")
                     t_up = t.get("uploader", "")
 
-                    t_link = f"[{t_title}]({t_url})" if t_url else f"**{t_title}**"
+                    t_link = f"**[{t_title}](<{t_url}>)**" if t_url else f"**{t_title}**"
                     t_up_part = f" by **{t_up}**" if t_up else ""
-                    t_dur_part = f" (` {t_dur} `)" if t_dur else ""
+                    t_dur_part = f" (`{t_dur}`)" if t_dur else ""
                     lines.append(f"`{i}.` {t_link}{t_up_part}{t_dur_part}")
                 if len(self.queue) > 10:
                     lines.append(f"... and {len(self.queue) - 10} more tracks.")
 
-            await interaction.response.send_message("\n".join(lines))
+            await interaction.response.send_message("\n".join(lines), suppress_embeds=True)
 
         @bot.tree.command(name="clear", description="Kosongkan semua antrean lagu yang ada")
         async def cmd_clear(interaction: discord.Interaction):
