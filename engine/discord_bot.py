@@ -1000,10 +1000,21 @@ class DiscordVoiceBot:
                 dl_opts["outtmpl"] = os.path.join(cache_dir, "%(id)s.%(ext)s")
                 dl_opts["noplaylist"] = True
 
-                ytdl_dl = yt_dlp.YoutubeDL(dl_opts)
-                data = await loop.run_in_executor(
-                    None, lambda: ytdl_dl.extract_info(sanitized_target, download=True)
-                )
+                try:
+                    ytdl_dl = yt_dlp.YoutubeDL(dl_opts)
+                    data = await loop.run_in_executor(
+                        None, lambda: ytdl_dl.extract_info(sanitized_target, download=True)
+                    )
+                except Exception as dl_err:
+                    if "cookiefile" in dl_opts:
+                        print(f"[DiscordBot] Download with cookies encountered error ({dl_err}), retrying without cookies...")
+                        dl_opts.pop("cookiefile", None)
+                        ytdl_dl = yt_dlp.YoutubeDL(dl_opts)
+                        data = await loop.run_in_executor(
+                            None, lambda: ytdl_dl.extract_info(sanitized_target, download=True)
+                        )
+                    else:
+                        raise dl_err
 
                 if data and "entries" in data:
                     entries = [e for e in data["entries"] if e]
