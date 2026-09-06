@@ -9,6 +9,7 @@ import html
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import threading
@@ -363,6 +364,203 @@ async def async_search_youtube_suggestions(
 ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env"))
 CONFIG_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".bot_config.json"))
 USER_HISTORY_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cache", "user_history.json"))
+AUDIO_CACHE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cache"))
+DEFAULT_MAX_CACHE_MB = 500
+DEFAULT_MAX_CACHE_FILES = 50
+
+
+def load_env_file():
+    """Load key-value pairs from .env into os.environ if not already present."""
+    if os.path.exists(ENV_PATH):
+        try:
+            with open(ENV_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, val = line.split("=", 1)
+                    key = key.strip()
+                    val = val.strip().strip("\"'")
+                    if key and key not in os.environ:
+                        os.environ[key] = val
+        except Exception:
+            pass
+
+
+# Automatically load .env into os.environ on import
+load_env_file()
+
+
+def get_cache_limits() -> Tuple[int, int]:
+    """Return (max_bytes, max_files) configured via .env / environment variables or defaults."""
+    load_env_file()
+    try:
+        mb = int(os.environ.get("MAX_CACHE_MB", str(DEFAULT_MAX_CACHE_MB)))
+    except (ValueError, TypeError):
+        mb = DEFAULT_MAX_CACHE_MB
+    try:
+        files = int(os.environ.get("MAX_CACHE_FILES", str(DEFAULT_MAX_CACHE_FILES)))
+    except (ValueError, TypeError):
+        files = DEFAULT_MAX_CACHE_FILES
+    return max(50, mb) * 1024 * 1024, max(10, files)
+
+
+def extract_youtube_video_id(url_or_query: str) -> Optional[str]:
+    """Extract 11-character YouTube video ID from URL or raw ID string."""
+    if not url_or_query:
+        return None
+    clean = url_or_query.strip()
+    if len(clean) == 11 and re.match(r"^[a-zA-Z0-9_-]{11}$", clean):
+        return clean
+    patterns = [
+        r"(?:v=|\/v\/|youtu\.be\/|embed\/|live\/)([a-zA-Z0-9_-]{11})",
+        r"[\?&]v=([a-zA-Z0-9_-]{11})",
+    ]
+    for p in patterns:
+        m = re.search(p, clean)
+        if m:
+            return m.group(1)
+    return None
+
+
+def find_cached_track(cache_dir: str, vid_id: str) -> Tuple[Optional[str], Optional[Dict[str, any]]]:
+    """
+    Check if a valid audio file for the video ID already exists in cache_dir.
+    Returns (audio_filepath, metadata_dict) or (None, None).
+    """
+    if not os.path.exists(cache_dir) or not vid_id:
+        return None, None
+
+    audio_exts = (".opus", ".webm", ".m4a", ".mp3", ".ogg", ".wav", ".flac", ".aac")
+    cached_file = None
+    try:
+        for fname in os.listdir(cache_dir):
+            if fname.startswith(f"{vid_id}.") and fname.lower().endswith(audio_exts):
+                full_path = os.path.join(cache_dir, fname)
+                # Verify file exists and is not an empty/corrupted stub (minimum 1KB)
+                if os.path.isfile(full_path) and os.path.getsize(full_path) > 1024:
+                    cached_file = full_path
+                    break
+    except OSError:
+        return None, None
+
+    if not cached_file:
+        return None, None
+
+    meta = None
+    meta_path = os.path.join(cache_dir, f"{vid_id}.json")
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            meta = None
+
+    # Fallback to user history if dedicated .json doesn't exist
+    if not meta:
+        hist_path = os.path.join(cache_dir, "user_history.json")
+        if os.path.exists(hist_path):
+            try:
+                with open(hist_path, "r", encoding="utf-8") as f:
+                    all_hist = json.load(f)
+                    for u_songs in all_hist.values():
+                        if isinstance(u_songs, list):
+                            for s in u_songs:
+                                if vid_id in s.get("webpage_url", ""):
+                                    meta = dict(s)
+                                    break
+                            if meta:
+                                break
+            except Exception:
+                pass
+
+    if not meta:
+        meta = {
+            "title": vid_id,
+            "uploader": "",
+            "duration_sec": 0,
+            "duration_str": "",
+            "webpage_url": f"https://www.youtube.com/watch?v={vid_id}",
+            "video_id": vid_id,
+        }
+
+    return cached_file, meta
+
+
+def save_track_cache_meta(cache_dir: str, vid_id: str, meta: Dict[str, any]):
+    """Save track metadata to cache/{vid_id}.json."""
+    if not vid_id or not os.path.exists(cache_dir):
+        return
+    meta_path = os.path.join(cache_dir, f"{vid_id}.json")
+    try:
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[DiscordBot] Notice: failed to save track cache meta for {vid_id}: {e}")
+
+
+def prune_audio_cache(
+    cache_dir: str,
+    max_bytes: Optional[int] = None,
+    max_files: Optional[int] = None,
+):
+    """
+    LRU Cache Eviction: Prunes old cached audio files when cache exceeds size or file limits.
+    Prevents VPS disk bloat by keeping storage footprint strictly capped.
+    """
+    if not os.path.exists(cache_dir):
+        return
+
+    if max_bytes is None or max_files is None:
+        cfg_bytes, cfg_files = get_cache_limits()
+        max_bytes = max_bytes or cfg_bytes
+        max_files = max_files or cfg_files
+
+    audio_exts = {".opus", ".webm", ".m4a", ".mp3", ".ogg", ".wav", ".flac", ".aac"}
+    entries = []
+    total_size = 0
+
+    try:
+        for fname in os.listdir(cache_dir):
+            fpath = os.path.join(cache_dir, fname)
+            if not os.path.isfile(fpath):
+                continue
+            base, ext = os.path.splitext(fname)
+            if ext.lower() in audio_exts:
+                try:
+                    stat = os.stat(fpath)
+                    acc_time = max(stat.st_atime, stat.st_mtime)
+                    entries.append((acc_time, stat.st_size, fpath, base))
+                    total_size += stat.st_size
+                except OSError:
+                    pass
+    except OSError:
+        return
+
+    if total_size <= max_bytes and len(entries) <= max_files:
+        return
+
+    # Sort oldest accessed first (LRU)
+    entries.sort(key=lambda x: x[0])
+    target_bytes = int(max_bytes * 0.8)
+    target_files = int(max_files * 0.8)
+
+    pruned_count = 0
+    for acc_time, size, fpath, base in entries:
+        if total_size <= target_bytes and len(entries) - pruned_count <= target_files:
+            break
+        try:
+            os.remove(fpath)
+            total_size -= size
+            pruned_count += 1
+            meta_path = os.path.join(cache_dir, f"{base}.json")
+            if os.path.exists(meta_path):
+                os.remove(meta_path)
+        except OSError:
+            pass
+
+    if pruned_count > 0:
+        print(f"[DiscordBot] Cache auto-prune: removed {pruned_count} old audio files to maintain storage quota.")
 
 
 def load_user_history() -> Dict[str, List[Dict[str, any]]]:
@@ -542,6 +740,7 @@ class DiscordVoiceBot:
         self.ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
         self.user_history: Dict[str, List[Dict[str, any]]] = load_user_history()
         self._history_lock = threading.Lock()
+        prune_audio_cache(AUDIO_CACHE_DIR)
 
     def record_user_history(self, user_id: Union[int, str], track: Dict[str, any]):
         """Record a played/enqueued song to user history (max 25 songs, FIFO with deduplication)."""
@@ -777,8 +976,10 @@ class DiscordVoiceBot:
                 await interaction.followup.send(f"Failed to connect to voice channel: {e}")
                 return
 
-            # Send immediate feedback so Discord's "Woeyyy is thinking..." disappears in 0.1s!
-            msg_handle = await interaction.followup.send("Searching...")
+            # Send immediate feedback tailored to input type
+            is_direct_url = query.strip().startswith("http://") or query.strip().startswith("https://")
+            status_msg = "Loading audio..." if is_direct_url else "Searching YouTube..."
+            msg_handle = await interaction.followup.send(status_msg)
 
             self._notify_status("SEARCHING", "Searching for track...")
 
@@ -1216,6 +1417,47 @@ class DiscordVoiceBot:
             cache_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cache"))
             os.makedirs(cache_dir, exist_ok=True)
 
+            # --- Instant Cache Bypass: Instant Playback for Cached Songs ---
+            vid_id = extract_youtube_video_id(sanitized_target)
+            if vid_id:
+                cached_file, cached_meta = find_cached_track(cache_dir, vid_id)
+                if cached_file and cached_meta:
+                    try:
+                        os.utime(cached_file, None)
+                    except OSError:
+                        pass
+
+                    if not emoji:
+                        guild = getattr(self.voice_client, "guild", None) if self.voice_client else None
+                        emoji = get_random_server_emoji(guild)
+
+                    sec = cached_meta.get("duration_sec", 0) or 0
+                    dur_str = cached_meta.get("duration_str") or (f"{sec // 60}:{sec % 60:02d}" if sec else "Live")
+
+                    track = {
+                        "filepath": cached_file,
+                        "url": cached_file,
+                        "title": cached_meta.get("title", vid_id),
+                        "uploader": cached_meta.get("uploader", ""),
+                        "duration_sec": sec,
+                        "duration_str": dur_str,
+                        "webpage_url": cached_meta.get("webpage_url", f"https://www.youtube.com/watch?v={vid_id}"),
+                        "requester": requester,
+                        "http_headers": {},
+                        "is_stream": False,
+                        "timestamp": time.time(),
+                        "emoji": emoji,
+                    }
+
+                    if self.is_playing or self.is_paused:
+                        self.queue.append(track)
+                        self._notify_status("ENQUEUED", track["title"])
+                        self._notify_status("QUEUE_UPDATED", "")
+                        return True, "Added to queue", True, track
+                    else:
+                        await self._async_play_track(track)
+                        return True, "Now playing", False, track
+
             loop = asyncio.get_event_loop()
             data = None
             direct_url = None
@@ -1335,6 +1577,23 @@ class DiscordVoiceBot:
                 "timestamp": time.time(),
                 "emoji": emoji,
             }
+
+            # Save metadata and enforce storage limits
+            target_vid = data.get("id") or vid_id or extract_youtube_video_id(data.get("webpage_url", ""))
+            if target_vid and filepath and os.path.exists(filepath):
+                save_track_cache_meta(
+                    cache_dir,
+                    target_vid,
+                    {
+                        "title": title,
+                        "uploader": uploader,
+                        "duration_sec": sec,
+                        "duration_str": dur_str,
+                        "webpage_url": data.get("webpage_url", f"https://www.youtube.com/watch?v={target_vid}"),
+                        "video_id": target_vid,
+                    },
+                )
+                prune_audio_cache(cache_dir)
 
             # Check if playback is currently active
             if self.is_playing or self.is_paused:
@@ -1491,6 +1750,21 @@ class DiscordVoiceBot:
                                     track["filepath"] = dl_filepath
                                     track["url"] = dl_filepath
                                     track["is_stream"] = False
+                                    fb_vid = fallback_data.get("id") or extract_youtube_video_id(track.get("webpage_url", ""))
+                                    if fb_vid:
+                                        save_track_cache_meta(
+                                            cache_dir,
+                                            fb_vid,
+                                            {
+                                                "title": track.get("title", fb_vid),
+                                                "uploader": track.get("uploader", ""),
+                                                "duration_sec": track.get("duration_sec", 0),
+                                                "duration_str": track.get("duration_str", ""),
+                                                "webpage_url": track.get("webpage_url", f"https://www.youtube.com/watch?v={fb_vid}"),
+                                                "video_id": fb_vid,
+                                            },
+                                        )
+                                        prune_audio_cache(cache_dir)
                                     await self._async_play_track(track)
                                     return
                             except Exception as dl_err:
@@ -1498,13 +1772,15 @@ class DiscordVoiceBot:
                         asyncio.run_coroutine_threadsafe(_fallback_download(), self._loop)
                         return
 
-                # Auto-cleanup cached file after song completes to preserve storage space
-                try:
-                    cached_f = track.get("filepath")
-                    if cached_f and os.path.exists(cached_f):
-                        os.remove(cached_f)
-                except Exception:
-                    pass
+                # Keep cached file for instant replay, but enforce LRU cache quota
+                cached_f = track.get("filepath")
+                if cached_f and os.path.exists(cached_f):
+                    try:
+                        os.utime(cached_f, None)
+                    except OSError:
+                        pass
+                    cache_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cache"))
+                    prune_audio_cache(cache_dir)
 
                 # Check if there are songs waiting in the queue
                 if self.queue and self.voice_client and self.voice_client.is_connected():

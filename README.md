@@ -13,6 +13,7 @@ The project is completely headless, with no GUI dependencies or local audio devi
 - **Direct Voice Streaming**: Plays 48kHz stereo Opus audio directly into Discord voice channels.
 - **YouTube and YouTube Music**: Supports search queries, regular YouTube links, and `music.youtube.com` URL normalization.
 - **Voice Channel Status**: Dynamically displays the currently playing track and emoji under the voice channel name.
+- **Instant Cache Bypass & LRU Storage**: Repeated songs and cached tracks start playing instantly (<10ms) while an automatic LRU cleaner keeps storage capped (`MAX_CACHE_MB=500`, `MAX_CACHE_FILES=50`).
 - **Slash Commands & Autocomplete**: Autocomplete suggestions appear in chat when typing `/play`, prioritizing your recent playback history.
 - **Stream Auto-Recovery**: Automatically detects premature stream termination and falls back to cached download.
 - **Queue Management**: Enqueues tracks, automatically advances to the next song, and supports track skipping.
@@ -116,12 +117,41 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-#### 3. Token & Cookies Configuration
-Create a `.env` file with your bot token:
+#### 3. Configuration (`.env`)
+Copy the template and configure your environment:
 ```bash
-echo "DISCORD_BOT_TOKEN=YOUR_BOT_TOKEN" > .env
+cp .env.example .env
 chmod 600 .env
 ```
+
+Edit `.env` to insert your bot token and adjust cache limits:
+```env
+DISCORD_BOT_TOKEN=YOUR_BOT_TOKEN
+BOT_MODE=server
+MAX_CACHE_MB=500
+MAX_CACHE_FILES=50
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `DISCORD_BOT_TOKEN` | *None* | Discord Bot Token from Developer Portal (Required). |
+| `BOT_MODE` | `server` | `server` (cached download for high VPS stability) or `local` (zero-download streaming). |
+| `MAX_CACHE_MB` | `500` | Maximum disk space in MB allocated for cached audio. Automatically prunes oldest tracks when exceeded. |
+| `MAX_CACHE_FILES` | `50` | Maximum number of cached audio tracks in `cache/` before LRU auto-cleanup. |
+
+#### Cache Sizing Guide (`MAX_CACHE_MB` vs `MAX_CACHE_FILES`)
+
+The average YouTube audio track (Opus 48kHz ~160kbps, ~3.5 to 4 minutes) requires approximately **4 to 5 MB per song**.  
+Use the recommended ratios below to balance fast playback and server storage limits:
+
+| Target Song Count (`MAX_CACHE_FILES`) | Estimated Audio Footprint | Recommended `MAX_CACHE_MB` | Recommended Use Case |
+|---|---|---|---|
+| **50 tracks** (Default) | ~200 - 250 MB | `500` (500 MB) | Standard default, ideal for smaller VPS servers (10–20 GB disk) |
+| **100 tracks** | ~400 - 500 MB | `800` (800 MB) | Suitable for small to medium Discord communities |
+| **200 tracks** | ~800 MB - 1 GB | `1200` (1.2 GB) | **Recommended for 200 tracks** (leaves safety margin for extended tracks) |
+| **500 tracks** | ~2.0 - 2.5 GB | `3000` (3.0 GB) | Large communities with diverse playlists |
 
 > **Note on Cookies**: Cookies are **optional**. Both streaming and downloading work out of the box in guest mode without cookies. If an optional `cookies.txt` is provided and fails or expires, the bot automatically retries in clean guest mode.
 

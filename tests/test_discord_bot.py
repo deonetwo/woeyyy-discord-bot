@@ -468,9 +468,128 @@ class TestDiscordVoiceBot(unittest.TestCase):
         self.assertLessEqual(len(res4), 100)
         self.assertTrue(res4.endswith("..."))
 
+    def test_extract_youtube_video_id(self):
+        """Test extract_youtube_video_id correctly extracts 11-char IDs from various formats."""
+        from engine.discord_bot import extract_youtube_video_id
+
+        self.assertEqual(extract_youtube_video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), "dQw4w9WgXcQ")
+        self.assertEqual(extract_youtube_video_id("https://youtu.be/dQw4w9WgXcQ"), "dQw4w9WgXcQ")
+        self.assertEqual(extract_youtube_video_id("https://music.youtube.com/watch?v=dQw4w9WgXcQ&feat=1"), "dQw4w9WgXcQ")
+        self.assertEqual(extract_youtube_video_id("https://www.youtube.com/embed/dQw4w9WgXcQ"), "dQw4w9WgXcQ")
+        self.assertEqual(extract_youtube_video_id("dQw4w9WgXcQ"), "dQw4w9WgXcQ")
+        self.assertIsNone(extract_youtube_video_id("random search query"))
+
+    def test_find_cached_track_and_lru_pruning(self):
+        """Test cached track retrieval and LRU size pruning."""
+        import tempfile, os, json
+        from engine.discord_bot import find_cached_track, save_track_cache_meta, prune_audio_cache
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vid = "testvideo12"
+            audio_file = os.path.join(tmpdir, f"{vid}.opus")
+            with open(audio_file, "wb") as f:
+                f.write(b"0" * 2048)  # > 1KB
+
+            meta = {
+                "title": "Test Song",
+                "uploader": "Test Artist",
+                "duration_sec": 120,
+                "duration_str": "2:00",
+                "webpage_url": f"https://www.youtube.com/watch?v={vid}",
+                "video_id": vid,
+            }
+            save_track_cache_meta(tmpdir, vid, meta)
+
+            found_f, found_m = find_cached_track(tmpdir, vid)
+            self.assertEqual(found_f, audio_file)
+            self.assertEqual(found_m.get("title"), "Test Song")
+
+            # Create 3 files and test LRU pruning with max_files=2
+            f2 = os.path.join(tmpdir, "vid2xxxxxxx.opus")
+            f3 = os.path.join(tmpdir, "vid3xxxxxxx.opus")
+            with open(f2, "wb") as f:
+                f.write(b"0" * 2048)
+            with open(f3, "wb") as f:
+                f.write(b"0" * 2048)
+            save_track_cache_meta(tmpdir, "vid2xxxxxxx", {"title": "Song 2"})
+            save_track_cache_meta(tmpdir, "vid3xxxxxxx", {"title": "Song 3"})
+
+            # Make f2 and f3 newer
+            now = os.path.getmtime(audio_file)
+            os.utime(f2, (now + 10, now + 10))
+            os.utime(f3, (now + 20, now + 20))
+
+            # Prune with max_files=2
+            prune_audio_cache(tmpdir, max_bytes=10 * 1024 * 1024, max_files=2)
+            # Oldest file (audio_file) should be removed
+            self.assertFalse(os.path.exists(audio_file))
+            self.assertFalse(os.path.exists(os.path.join(tmpdir, f"{vid}.json")))
+            self.assertTrue(os.path.exists(f3))
+
+    def test_async_enqueue_instant_cache_hit(self):
+        """Test _async_enqueue_or_play returns immediately on instant cache hit without yt-dlp."""
+        import asyncio, tempfile, os
+        from unittest.mock import patch, MagicMock
+        from engine.discord_bot import DiscordVoiceBot, save_track_cache_meta
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vid = "quickhit123"
+            cached_audio = os.path.join(tmpdir, f"{vid}.webm")
+            with open(cached_audio, "wb") as f:
+                f.write(b"x" * 2048)
+            save_track_cache_meta(tmpdir, vid, {
+                "title": "Instant Hit Song",
+                "uploader": "Cached Artist",
+                "duration_sec": 180,
+                "duration_str": "3:00",
+                "webpage_url": f"https://www.youtube.com/watch?v={vid}",
+                "video_id": vid,
+            })
+
+            bot = DiscordVoiceBot(is_local=False)
+            bot._async_play_track = MagicMock()
+            async def _dummy_play(t):
+                pass
+            bot._async_play_track.side_effect = _dummy_play
+
+            # Mock AUDIO_CACHE_DIR to use our tmpdir
+            with patch("engine.discord_bot.AUDIO_CACHE_DIR", tmpdir), \
+                 patch("os.path.abspath", side_effect=lambda p: tmpdir if "cache" in p else p):
+                success, msg, is_queued, track = asyncio.run(
+                    bot._async_enqueue_or_play(f"https://www.youtube.com/watch?v={vid}", requester="Tester")
+                )
+
+                self.assertTrue(success)
+                self.assertFalse(is_queued)
+                self.assertEqual(track["title"], "Instant Hit Song")
+                self.assertEqual(track["filepath"], cached_audio)
+
+    def test_load_env_file_and_cache_limits(self):
+        """Test load_env_file loads MAX_CACHE_MB and MAX_CACHE_FILES from .env into get_cache_limits."""
+        import tempfile, os
+        from unittest.mock import patch
+        from engine.discord_bot import get_cache_limits, load_env_file
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_file = os.path.join(tmpdir, ".env")
+            with open(env_file, "w", encoding="utf-8") as f:
+                f.write("MAX_CACHE_MB=350\nMAX_CACHE_FILES=25\n")
+
+            with patch("engine.discord_bot.ENV_PATH", env_file), \
+                 patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("MAX_CACHE_MB", None)
+                os.environ.pop("MAX_CACHE_FILES", None)
+
+                load_env_file()
+                max_bytes, max_files = get_cache_limits()
+
+                self.assertEqual(max_bytes, 350 * 1024 * 1024)
+                self.assertEqual(max_files, 25)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
