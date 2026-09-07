@@ -29,6 +29,10 @@ import yt_dlp
 # Suppress benign aiohttp unclosed connector ResourceWarnings on exit
 warnings.filterwarnings("ignore", message=".*unclosed.*", category=ResourceWarning)
 warnings.filterwarnings("ignore", message=".*Unclosed.*", category=ResourceWarning)
+# Suppress benign yt-dlp Python 3.10 deprecation warnings on Linux environments
+warnings.filterwarnings("ignore", message=".*Python version 3\\..*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*Python version 3\\..*", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message=".*Python version 3\\..*")
 
 from engine.security import (
     secure_file_permissions,
@@ -780,10 +784,11 @@ def load_user_history() -> Dict[str, List[Dict[str, any]]]:
     """Load persistent song play history per user from cache/user_history.json."""
     if os.path.exists(USER_HISTORY_PATH):
         try:
-            if os.path.getsize(USER_HISTORY_PATH) == 0:
-                return {}
             with open(USER_HISTORY_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                content = f.read().strip()
+                if not content:
+                    return {}
+                data = json.loads(content)
                 if isinstance(data, dict):
                     return data
         except Exception as e:
@@ -1060,6 +1065,13 @@ class DiscordVoiceBot:
         threading.Thread(target=prune_audio_cache, args=(AUDIO_CACHE_DIR,), daemon=True).start()
         threading.Thread(target=AUDIO_CACHE_INDEX.sync_from_disk, args=(AUDIO_CACHE_DIR,), daemon=True).start()
 
+        # Smart Auto-Leave settings (seconds, 0 to disable)
+        self.auto_leave_empty_timeout: int = int(os.environ.get("AUTO_LEAVE_EMPTY_TIMEOUT", 180))  # 3 minutes default
+        self.auto_leave_idle_timeout: int = int(os.environ.get("AUTO_LEAVE_IDLE_TIMEOUT", 300))    # 5 minutes default
+        self._empty_since: Optional[float] = None
+        self._idle_since: Optional[float] = None
+        self._auto_leave_task: Optional[asyncio.Task] = None
+
     def record_user_history(self, user_id: Union[int, str], track: Dict[str, any]):
         """Record a played/enqueued song to user history (max 25 songs, FIFO with deduplication)."""
         uid = str(user_id)
@@ -1228,7 +1240,10 @@ class DiscordVoiceBot:
                 if ch and isinstance(ch, discord.VoiceChannel):
                     await ch.edit(status=status)
         except Exception as e:
-            # Requires 'Set Voice Channel Status' permission
+            # Requires 'Set Voice Channel Status' permission.
+            # If status is None (resetting status when leaving) and permission is missing/403, silently ignore
+            if status is None and "403" in str(e):
+                return
             print(f"[DiscordBot] Notice: could not update voice channel status: {e}")
 
     def _notify_status(self, status: str, detail: str = ""):
@@ -1561,12 +1576,15 @@ class DiscordVoiceBot:
             except Exception as e:
                 print(f"[DiscordBot] Note on syncing slash commands: {e}")
 
+            # Start background smart auto-leave monitor task
+            if self._auto_leave_task is None or self._auto_leave_task.done():
+                self._auto_leave_task = self._loop.create_task(self._auto_leave_monitor_loop())
+
         @self.client.event
         async def on_voice_state_update(member, before, after):
             if member == self.client.user:
                 if after.channel is None:
-                    old_cid = self.current_channel_id or (before.channel.id if before and before.channel else None)
-                    await self._update_voice_channel_status(None, channel_id=old_cid)
+                    # Bot was disconnected from voice channel
                     self.is_in_voice = False
                     if before and before.channel and hasattr(before.channel, "guild"):
                         g_vc = getattr(before.channel.guild, "voice_client", None)
@@ -1577,14 +1595,28 @@ class DiscordVoiceBot:
                                 pass
                     self.voice_client = None
                     self.current_channel_id = None
+                    self._empty_since = None
+                    self._idle_since = None
                     self._notify_status("VOICE_DISCONNECTED", "Left voice channel")
                 else:
                     self.is_in_voice = True
                     self.current_channel_id = after.channel.id
                     self.voice_client = getattr(after.channel.guild, "voice_client", None)
+                    self._empty_since = None
+                    if not self.is_playing and not self.is_paused:
+                        self._idle_since = time.time()
                     self._notify_status("VOICE_CONNECTED", after.channel.name)
                     if not self.is_playing and not self.is_paused:
                         await self._update_voice_channel_status("Waiting for song requests", channel_id=after.channel.id)
+            elif self.is_in_voice and self.voice_client and self.voice_client.channel:
+                # Track when human members leave or join the bot's current channel
+                if before and before.channel and before.channel.id == self.current_channel_id:
+                    human_members = [m for m in self.voice_client.channel.members if not m.bot]
+                    if len(human_members) == 0 and self._empty_since is None:
+                        self._empty_since = time.time()
+                elif after and after.channel and after.channel.id == self.current_channel_id:
+                    if not member.bot:
+                        self._empty_since = None
 
         try:
             self._loop.run_until_complete(self.client.start(token))
@@ -1614,6 +1646,9 @@ class DiscordVoiceBot:
 
     def stop(self):
         """Disconnect and stop the Discord bot cleanly."""
+        if self._auto_leave_task and not self._auto_leave_task.done():
+            self._auto_leave_task.cancel()
+
         if not self.is_connected or not self._loop or not self.client:
             return
 
@@ -1713,12 +1748,68 @@ class DiscordVoiceBot:
             self.is_in_voice = False
             self.voice_client = None
             self.current_channel_id = None
+            self._empty_since = None
+            self._idle_since = None
             self.queue.clear()
             self.current_track = None
             self._notify_status("VOICE_DISCONNECTED", "Left voice channel")
             self._notify_status("QUEUE_UPDATED", "")
 
         asyncio.run_coroutine_threadsafe(_async_leave(), self._loop)
+
+    async def _auto_leave_monitor_loop(self):
+        """Periodically check for empty voice channels or prolonged idle states to leave cleanly."""
+        while self.is_connected and self._loop and self._loop.is_running():
+            try:
+                await asyncio.sleep(15)
+                if not self.is_in_voice or not self.voice_client or not self.voice_client.is_connected():
+                    self._empty_since = None
+                    self._idle_since = None
+                    continue
+
+                channel = self.voice_client.channel
+                if not channel:
+                    continue
+
+                now = time.time()
+
+                # 1. Check if channel is empty (no human members present)
+                if self.auto_leave_empty_timeout > 0:
+                    human_members = [m for m in channel.members if not m.bot]
+                    if len(human_members) == 0:
+                        if self._empty_since is None:
+                            self._empty_since = now
+                        elif (now - self._empty_since) >= self.auto_leave_empty_timeout:
+                            print(
+                                f"[DiscordBot] Auto-leaving voice channel: channel '#{channel.name}' has been empty for {self.auto_leave_empty_timeout}s."
+                            )
+                            self._empty_since = None
+                            self._idle_since = None
+                            self.leave_voice_channel()
+                            continue
+                    else:
+                        self._empty_since = None
+
+                # 2. Check if bot has been idle (no audio playing, not paused, queue empty)
+                if self.auto_leave_idle_timeout > 0:
+                    if not self.is_playing and not self.is_paused and not self.queue:
+                        if self._idle_since is None:
+                            self._idle_since = now
+                        elif (now - self._idle_since) >= self.auto_leave_idle_timeout:
+                            print(
+                                f"[DiscordBot] Auto-leaving voice channel: idle timeout reached ({self.auto_leave_idle_timeout}s without playback)."
+                            )
+                            self._idle_since = None
+                            self._empty_since = None
+                            self.leave_voice_channel()
+                            continue
+                    else:
+                        self._idle_since = None
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
 
     async def _async_enqueue_or_play(self, query_or_url: str, requester: str = "Host", emoji: str = "") -> Tuple[bool, str, bool, Dict[str, any]]:
         """
@@ -2169,6 +2260,7 @@ class DiscordVoiceBot:
                     self.is_paused = False
                     self.current_track = None
                     self.current_title = "No audio playing"
+                    self._idle_since = time.time()
                     self._notify_status("PLAYBACK_STOPPED", "")
                     self._notify_status("QUEUE_UPDATED", "")
                     if self._loop and self._loop.is_running():
@@ -2189,6 +2281,7 @@ class DiscordVoiceBot:
             self.voice_client.play(transformer, after=_after_play)
             self.is_playing = True
             self.is_paused = False
+            self._idle_since = None
             self._notify_status("PLAYING", track["title"])
             self._notify_status("QUEUE_UPDATED", "")
 
@@ -2283,6 +2376,7 @@ class DiscordVoiceBot:
         self.is_playing = False
         self.is_paused = False
         self.current_title = "No audio playing"
+        self._idle_since = time.time()
         self._notify_status("PLAYBACK_STOPPED", "")
         self._notify_status("QUEUE_UPDATED", "")
         if self._loop and self._loop.is_running():

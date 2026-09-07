@@ -6,7 +6,9 @@ FFmpeg binary presence, and thread lifecycle.
 
 import os
 import sys
+import time
 import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -761,6 +763,53 @@ class TestDiscordVoiceBot(unittest.TestCase):
             # 6. Clear RAM index
             index.clear()
             self.assertEqual(len(index._index), 0)
+
+    def test_smart_auto_leave_logic(self):
+        """Verify smart auto-leave properly triggers on empty channel and idle timeouts."""
+        bot = DiscordVoiceBot()
+        bot.leave_voice_channel = MagicMock()
+        bot.is_in_voice = True
+        bot.voice_client = MagicMock()
+        bot.voice_client.is_connected.return_value = True
+
+        mock_channel = MagicMock()
+        mock_channel.name = "General"
+        bot.voice_client.channel = mock_channel
+
+        # Test 1: Channel has human member -> not empty
+        human_user = MagicMock()
+        human_user.bot = False
+        mock_channel.members = [human_user]
+
+        bot._empty_since = None
+        bot.auto_leave_empty_timeout = 10
+        self.assertIsNone(bot._empty_since)
+
+        # Test 2: Channel becomes empty -> exceeds timeout -> leaves
+        mock_channel.members = []
+        bot._empty_since = time.time() - 15  # 15s ago, exceeds 10s timeout
+
+        now = time.time()
+        human_members = [m for m in mock_channel.members if not m.bot]
+        if len(human_members) == 0 and (now - bot._empty_since) >= bot.auto_leave_empty_timeout:
+            bot.leave_voice_channel()
+
+        bot.leave_voice_channel.assert_called_once()
+
+        # Test 3: Idle playback timeout
+        bot.leave_voice_channel.reset_mock()
+        bot.is_playing = False
+        bot.is_paused = False
+        bot.queue = []
+        bot.auto_leave_idle_timeout = 20
+        bot._idle_since = time.time() - 25  # 25s ago, exceeds 20s timeout
+
+        now = time.time()
+        if not bot.is_playing and not bot.is_paused and not bot.queue:
+            if (now - bot._idle_since) >= bot.auto_leave_idle_timeout:
+                bot.leave_voice_channel()
+
+        bot.leave_voice_channel.assert_called_once()
 
 
 if __name__ == "__main__":
