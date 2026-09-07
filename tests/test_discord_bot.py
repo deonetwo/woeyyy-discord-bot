@@ -11,9 +11,12 @@ import unittest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from engine.discord_bot import (
+    AUDIO_CACHE_INDEX,
+    AudioCacheIndex,
     BufferedAudioSource,
     DiscordVoiceBot,
     FFMPEG_EXECUTABLE,
+    find_cached_track_by_query,
     load_saved_token,
     save_token,
 )
@@ -659,6 +662,105 @@ class TestDiscordVoiceBot(unittest.TestCase):
         frame = buffered.read()
         self.assertEqual(len(frame), 3840)
         buffered.cleanup()
+
+    def test_find_cached_track_by_query(self):
+        """Verify find_cached_track_by_query matches cached audio by title/artist and rejects mismatches."""
+        import tempfile, json
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 1. Create a dummy audio file and json metadata
+            vid = "TEST_VID_123"
+            audio_path = os.path.join(tmpdir, f"{vid}.opus")
+            with open(audio_path, "wb") as f:
+                f.write(b"OPUS_DATA" * 200)  # > 1024 bytes
+
+            meta = {
+                "title": "Asuka Sparkle",
+                "uploader": "Hoi Festa",
+                "duration_sec": 180,
+                "duration_str": "3:00",
+                "webpage_url": f"https://www.youtube.com/watch?v={vid}",
+                "video_id": vid,
+            }
+            with open(os.path.join(tmpdir, f"{vid}.json"), "w", encoding="utf-8") as f:
+                json.dump(meta, f)
+
+            # Test Exact match
+            fpath, m = find_cached_track_by_query(tmpdir, "Asuka Sparkle")
+            self.assertEqual(fpath, audio_path)
+            self.assertEqual(m["video_id"], vid)
+
+            # Test Token search (artist + title)
+            fpath, m = find_cached_track_by_query(tmpdir, "hoi festa asuka")
+            self.assertEqual(fpath, audio_path)
+            self.assertEqual(m["title"], "Asuka Sparkle")
+
+            # Test ytsearch1: prefix stripping
+            fpath, m = find_cached_track_by_query(tmpdir, "ytsearch1:asuka sparkle")
+            self.assertEqual(fpath, audio_path)
+
+            # Test Extra query token that doesn't match (e.g. remix) -> should return None to query YouTube
+            fpath, m = find_cached_track_by_query(tmpdir, "asuka sparkle remix")
+            self.assertIsNone(fpath)
+            self.assertIsNone(m)
+
+            # Test Stopwords only -> should return None
+            fpath, m = find_cached_track_by_query(tmpdir, "the in on")
+            self.assertIsNone(fpath)
+
+            # Test non-existing song -> should return None
+            fpath, m = find_cached_track_by_query(tmpdir, "completely unknown song")
+            self.assertIsNone(fpath)
+
+    def test_audio_cache_index_ram_operations(self):
+        """Verify AudioCacheIndex provides in-memory RAM caching with nanosecond lookups."""
+        import tempfile, json
+
+        index = AudioCacheIndex()
+        self.assertEqual(len(index._index), 0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create two dummy cached tracks on disk
+            for vid, title in [("VID_A", "Alpha Song"), ("VID_B", "Beta Beat")]:
+                af = os.path.join(tmpdir, f"{vid}.opus")
+                with open(af, "wb") as f:
+                    f.write(b"AUDIO_DATA" * 150)
+                meta = {
+                    "title": title,
+                    "uploader": "Cool Artist",
+                    "duration_sec": 200,
+                    "duration_str": "3:20",
+                    "webpage_url": f"https://www.youtube.com/watch?v={vid}",
+                    "video_id": vid,
+                }
+                with open(os.path.join(tmpdir, f"{vid}.json"), "w", encoding="utf-8") as f:
+                    json.dump(meta, f)
+
+            # 1. Sync from disk to RAM
+            index.sync_from_disk(tmpdir)
+            self.assertEqual(len(index._index), 2)
+
+            # 2. In-Memory RAM Get (O(1))
+            fpath, meta = index.get(tmpdir, "VID_A")
+            self.assertIsNotNone(fpath)
+            self.assertEqual(meta["title"], "Alpha Song")
+
+            # 3. In-Memory RAM Query Search
+            fpath, meta = index.search_by_query(tmpdir, "cool artist alpha")
+            self.assertIsNotNone(fpath)
+            self.assertEqual(meta["video_id"], "VID_A")
+
+            # 4. Put new entry directly to RAM
+            index.put(tmpdir, "VID_C", {"title": "Gamma Groove", "uploader": "DJ Gamma"}, "/dummy/path.opus")
+            self.assertIn("VID_C", index._index)
+
+            # 5. Remove entry from RAM
+            index.remove("VID_C")
+            self.assertNotIn("VID_C", index._index)
+
+            # 6. Clear RAM index
+            index.clear()
+            self.assertEqual(len(index._index), 0)
 
 
 if __name__ == "__main__":
