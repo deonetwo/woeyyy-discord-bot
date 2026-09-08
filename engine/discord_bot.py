@@ -126,11 +126,10 @@ YTDL_OPTIONS = {
 COOKIE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cookies.txt"))
 if os.path.exists(COOKIE_PATH):
     YTDL_OPTIONS["cookiefile"] = COOKIE_PATH
-    YTDL_OPTIONS["remote_components"] = ["ejs:github"]
     YTDL_OPTIONS["format"] = "ba/b"
     YTDL_OPTIONS["extractor_args"] = {
         "youtube": {
-            "player_client": ["web", "web_embedded", "mweb"],
+            "player_client": ["web", "mweb"],
         }
     }
 
@@ -1927,43 +1926,55 @@ class DiscordVoiceBot:
 
             # Fallback or Server Mode: Download to cache folder
             if not direct_url:
-                # 1. Search & fetch metadata first without downloading (fast, no disk write)
-                search_opts = dict(YTDL_OPTIONS)
-                search_opts["noplaylist"] = True
+                res_vid = vid_id or extract_youtube_video_id(sanitized_target)
 
-                try:
-                    ytdl_search = yt_dlp.YoutubeDL(search_opts)
-                    data = await loop.run_in_executor(
-                        None, lambda: ytdl_search.extract_info(sanitized_target, download=False)
-                    )
-                except Exception as search_err:
-                    print(f"[DiscordBot] Search metadata extraction error ({search_err}), proceeding to download...")
-                    data = None
+                # 1. If searching by query (not a direct video URL), perform super fast flat search (~300ms)
+                if not res_vid:
+                    search_opts = dict(YTDL_OPTIONS)
+                    search_opts["noplaylist"] = True
+                    search_opts["extract_flat"] = True
 
-                if data and "entries" in data:
-                    entries = [e for e in data["entries"] if e]
-                    data = entries[0] if entries else None
+                    try:
+                        ytdl_search = yt_dlp.YoutubeDL(search_opts)
+                        data = await loop.run_in_executor(
+                            None, lambda: ytdl_search.extract_info(sanitized_target, download=False)
+                        )
+                    except Exception as search_err:
+                        print(f"[DiscordBot] Search metadata extraction error ({search_err}), proceeding to download...")
+                        data = None
+
+                    if data and "entries" in data:
+                        entries = [e for e in data["entries"] if e]
+                        data = entries[0] if entries else None
+
+                    if data:
+                        res_vid = data.get("id") or extract_youtube_video_id(data.get("url", "")) or extract_youtube_video_id(data.get("webpage_url", ""))
 
                 # 2. Check if the resolved video ID is ALREADY in local cache!
-                if data:
-                    res_vid = data.get("id") or extract_youtube_video_id(data.get("webpage_url", ""))
-                    if res_vid:
-                        cached_file, cached_meta = find_cached_track(cache_dir, res_vid)
-                        if cached_file and os.path.exists(cached_file):
-                            filepath = cached_file
-                            direct_url = cached_file
-                            if cached_meta:
-                                if not data.get("title") and cached_meta.get("title"):
-                                    data["title"] = cached_meta["title"]
-                                if not data.get("uploader") and cached_meta.get("uploader"):
-                                    data["uploader"] = cached_meta["uploader"]
+                if res_vid:
+                    cached_file, cached_meta = find_cached_track(cache_dir, res_vid)
+                    if cached_file and os.path.exists(cached_file):
+                        filepath = cached_file
+                        direct_url = cached_file
+                        if not data:
+                            data = dict(cached_meta) if cached_meta else {}
+                        elif cached_meta:
+                            if not data.get("title") and cached_meta.get("title"):
+                                data["title"] = cached_meta["title"]
+                            if not data.get("uploader") and cached_meta.get("uploader"):
+                                data["uploader"] = cached_meta["uploader"]
 
-                # 3. Only download from YouTube if the audio file is NOT in cache
+                # 3. Only download from YouTube if the audio file is NOT in cache (Single-Pass)
                 if not direct_url:
                     dl_opts = dict(YTDL_OPTIONS)
                     dl_opts["outtmpl"] = os.path.join(cache_dir, "%(id)s.%(ext)s")
                     dl_opts["noplaylist"] = True
-                    dl_target = (data.get("webpage_url") if data else None) or sanitized_target
+                    dl_opts.pop("extract_flat", None)
+
+                    if res_vid:
+                        dl_target = f"https://www.youtube.com/watch?v={res_vid}"
+                    else:
+                        dl_target = (data.get("webpage_url") if data else None) or (data.get("url") if data else None) or sanitized_target
 
                     try:
                         ytdl_dl = yt_dlp.YoutubeDL(dl_opts)
