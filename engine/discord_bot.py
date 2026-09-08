@@ -103,11 +103,9 @@ def get_ffmpeg_binary() -> str:
 # Global FFmpeg binary path
 FFMPEG_EXECUTABLE = get_ffmpeg_binary()
 
-# YTDL options for fast, resilient audio stream extraction (bypasses datacenter bot blocks)
+# YTDL options for fast, resilient audio stream extraction (pure audio download, no heavy CPU transcoding)
 YTDL_OPTIONS = {
-    "format": "bestaudio/best",
-    "extractaudio": True,
-    "audioformat": "opus",
+    "format": "bestaudio/ba",
     "outtmpl": "%(extractor)s-%(id)s-%(title)s.%(ext)s",
     "restrictfilenames": True,
     "noplaylist": True,
@@ -118,20 +116,12 @@ YTDL_OPTIONS = {
     "no_warnings": True,
     "default_search": "ytsearch1:",
     "source_address": "0.0.0.0",
-    "buffersize": 131072,
-    "http_chunk_size": 10485760,
 }
 
 # Automatically bind cookies.txt if present to authenticate with YouTube
 COOKIE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cookies.txt"))
 if os.path.exists(COOKIE_PATH):
     YTDL_OPTIONS["cookiefile"] = COOKIE_PATH
-    YTDL_OPTIONS["format"] = "ba/b"
-    YTDL_OPTIONS["extractor_args"] = {
-        "youtube": {
-            "player_client": ["web", "mweb"],
-        }
-    }
 
 FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
