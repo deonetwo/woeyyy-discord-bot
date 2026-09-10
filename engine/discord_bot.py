@@ -18,7 +18,7 @@ import time
 import urllib.parse
 import urllib.request
 import warnings
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 import discord
