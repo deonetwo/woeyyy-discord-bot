@@ -34,6 +34,7 @@ The project is completely headless, with no GUI dependencies or local audio devi
 | `/queue` | Display current track queue |
 | `/clear` | Clear the track queue |
 | `/stop` | Stop playback and clear queue |
+| `/autoplay [mode]` | Control autoplay mode (`on`/`off` or interactive dropdown) |
 | `/volume <0-150>` | Set playback volume percentage |
 | `/leave` | Disconnect bot from voice channel |
 
@@ -47,6 +48,7 @@ When running interactively (`python main.py`):
 - `q, queue`: Display queue status
 - `pause` / `resume`: Pause or resume playback
 - `stop`: Stop playback and clear queue
+- `a, autoplay [on/off]`: Enable or disable autoplay mode
 - `v, vol <0-150>`: Set volume percentage
 - `help`: Display help message
 - `exit`, `quit`: Disconnect and exit

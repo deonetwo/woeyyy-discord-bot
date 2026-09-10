@@ -4,6 +4,7 @@ Verifies bot controller initialization, configuration storage,
 FFmpeg binary presence, and thread lifecycle.
 """
 
+import json
 import os
 import sys
 import time
@@ -811,10 +812,390 @@ class TestDiscordVoiceBot(unittest.TestCase):
 
         bot.leave_voice_channel.assert_called_once()
 
+    def test_audio_cache_index_get_random_track(self):
+        """Verify AudioCacheIndex get_random_track behavior."""
+        import tempfile
+        from engine.discord_bot import AudioCacheIndex
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            index = AudioCacheIndex()
+            # 1. Empty index returns None
+            self.assertIsNone(index.get_random_track(tmpdir))
+
+            # 2. Add files and entries
+            file_a = os.path.join(tmpdir, "VID_1.opus")
+            file_b = os.path.join(tmpdir, "VID_2.webm")
+            with open(file_a, "wb") as f:
+                f.write(b"0" * 2048)
+            with open(file_b, "wb") as f:
+                f.write(b"0" * 2048)
+
+            index.put(tmpdir, "VID_1", {"title": "Song One", "uploader": "Artist One", "video_id": "VID_1"}, file_a)
+            index.put(tmpdir, "VID_2", {"title": "Song Two", "uploader": "Artist Two", "video_id": "VID_2"}, file_b)
+
+            # 3. Random track returns a valid (filepath, meta) pair
+            res = index.get_random_track(tmpdir)
+            self.assertIsNotNone(res)
+            filepath, meta = res
+            self.assertIn(meta["video_id"], ["VID_1", "VID_2"])
+            self.assertTrue(os.path.exists(filepath))
+
+            # 4. Excluding VID_1 returns VID_2
+            res_ex = index.get_random_track(tmpdir, exclude_vid_id="VID_1")
+            self.assertIsNotNone(res_ex)
+            self.assertEqual(res_ex[1]["video_id"], "VID_2")
+
+    def test_create_track_from_cached_meta(self):
+        """Verify track dict creation from cached metadata for autoplay."""
+        from engine.discord_bot import create_track_from_cached_meta
+
+        meta = {
+            "video_id": "test1234",
+            "title": "Cool Song",
+            "uploader": "Cool Artist",
+            "duration_sec": 185,
+            "duration_str": "3:05",
+            "webpage_url": "https://www.youtube.com/watch?v=test1234",
+        }
+        track = create_track_from_cached_meta("/dummy/path/test1234.opus", meta, requester="Autoplay")
+        self.assertEqual(track["title"], "Cool Song")
+        self.assertEqual(track["uploader"], "Cool Artist")
+        self.assertEqual(track["duration_sec"], 185)
+        self.assertEqual(track["duration_str"], "3:05")
+        self.assertEqual(track["requester"], "Autoplay")
+        self.assertIn(track["emoji"], ["🎵", "🎶", "🎧", "✨"])
+        self.assertFalse(track["is_stream"])
+
+    def test_autoplay_slash_command_and_bot_state(self):
+        """Verify /autoplay slash command registration and bot toggle state."""
+        import discord
+        from discord.ext import commands
+        from engine.discord_bot import DiscordVoiceBot
+
+        bot = DiscordVoiceBot()
+        self.assertFalse(bot.autoplay)
+
+        bot.set_autoplay(True)
+        self.assertTrue(bot.autoplay)
+        bot.set_autoplay(False)
+        self.assertFalse(bot.autoplay)
+
+        intents = discord.Intents.default()
+        bot.client = commands.Bot(command_prefix="!", intents=intents)
+        bot._register_slash_commands()
+
+        cmd = None
+        for command in bot.client.tree.get_commands():
+            if command.name == "autoplay":
+                cmd = command
+                break
+
+        self.assertIsNotNone(cmd)
+        param = cmd.parameters[0]
+        self.assertEqual(param.name, "mode")
+        choice_values = [c.value for c in param.choices]
+        self.assertIn("on", choice_values)
+        self.assertIn("off", choice_values)
+
+        # Verify executing command works and defers properly without attribute errors
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        mock_interaction = MagicMock()
+        mock_interaction.guild = None
+        mock_interaction.response.defer = AsyncMock()
+        mock_interaction.followup.send = AsyncMock()
+        mock_interaction.user.voice = None
+
+        # Test mode="on"
+        asyncio.run(cmd.callback(mock_interaction, mode="on"))
+        mock_interaction.response.defer.assert_called_once()
+        mock_interaction.followup.send.assert_called_once()
+        self.assertTrue(bot.autoplay)
+        # Verify no cache count mentioned in message
+        send_msg = mock_interaction.followup.send.call_args[0][0]
+        self.assertNotIn("cached track", send_msg)
+
+        # Test mode="off"
+        mock_interaction.response.defer.reset_mock()
+        mock_interaction.followup.send.reset_mock()
+        asyncio.run(cmd.callback(mock_interaction, mode="off"))
+        mock_interaction.response.defer.assert_called_once()
+        mock_interaction.followup.send.assert_called_once()
+        self.assertFalse(bot.autoplay)
+
+        # Test mode=None (interactive dropdown view)
+        mock_interaction.response.defer.reset_mock()
+        mock_interaction.followup.send.reset_mock()
+        asyncio.run(cmd.callback(mock_interaction, mode=None))
+        mock_interaction.response.defer.assert_called_once()
+        mock_interaction.followup.send.assert_called_once()
+        sent_view = mock_interaction.followup.send.call_args[1].get("view")
+        self.assertIsNotNone(sent_view)
+
+    def test_user_queue_priority_over_autoplay(self):
+        """Verify user queued tracks take priority when autoplay is enabled."""
+        bot = DiscordVoiceBot()
+        bot.autoplay = True
+        bot.voice_client = MagicMock()
+        bot.voice_client.is_connected.return_value = True
+
+        # When queue has tracks, queue track is taken first
+        user_track = {"title": "User Song", "requester": "Alice"}
+        bot.queue.append(user_track)
+
+        self.assertEqual(len(bot.queue), 1)
+        next_track = bot.queue.pop(0)
+        self.assertEqual(next_track["title"], "User Song")
+        self.assertEqual(next_track["requester"], "Alice")
+
+    def test_manual_stop_playback_flag(self):
+        """Verify manual stop sets _manual_stop to prevent autoplay restarting immediately."""
+        bot = DiscordVoiceBot()
+        bot.autoplay = True
+        bot.voice_client = MagicMock()
+        bot.voice_client.is_playing.return_value = True
+
+        self.assertFalse(bot._manual_stop)
+        bot.stop_playback()
+        self.assertTrue(bot._manual_stop)
+        self.assertFalse(bot.is_playing)
+        self.assertEqual(len(bot.queue), 0)
+
+    def test_resolve_track_metadata_self_healing(self):
+        """Verify resolve_track_metadata recovers title and saves JSON when title is raw video_id."""
+        import tempfile
+        from engine.discord_bot import resolve_track_metadata
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_vid = "R_DpYHPoQEU"
+            dummy_file = os.path.join(tmpdir, f"{test_vid}.webm")
+            with open(dummy_file, "wb") as f:
+                f.write(b"0" * 2048)
+
+            # Raw video_id as title triggers resolution
+            raw_meta = {"title": test_vid, "video_id": test_vid}
+            with patch("engine.discord_bot.fetch_youtube_oembed_meta") as mock_oembed:
+                mock_oembed.return_value = {
+                    "title": "Drive - Bersama Bintang",
+                    "uploader": "Emotion Entertainment",
+                    "video_id": test_vid,
+                }
+                resolved = resolve_track_metadata(tmpdir, test_vid, raw_meta, dummy_file)
+                self.assertEqual(resolved["title"], "Drive - Bersama Bintang")
+                self.assertEqual(resolved["uploader"], "Emotion Entertainment")
+                self.assertEqual(resolved["video_id"], test_vid)
+
+                # Verify JSON was saved on disk
+                json_path = os.path.join(tmpdir, f"{test_vid}.json")
+                self.assertTrue(os.path.exists(json_path))
+                with open(json_path, "r", encoding="utf-8") as jf:
+                    saved = json.load(jf)
+                self.assertEqual(saved["title"], "Drive - Bersama Bintang")
+
+    def test_create_track_resolves_raw_id(self):
+        """Verify create_track_from_cached_meta replaces raw ID title with resolved title."""
+        import tempfile
+        from engine.discord_bot import create_track_from_cached_meta
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_vid = "vid12345678"
+            dummy_file = os.path.join(tmpdir, f"{test_vid}.webm")
+            with open(dummy_file, "wb") as f:
+                f.write(b"0" * 2048)
+
+            with patch("engine.discord_bot.fetch_youtube_oembed_meta") as mock_oembed:
+                mock_oembed.return_value = {
+                    "title": "Resolved Song Title",
+                    "uploader": "Resolved Artist",
+                    "video_id": test_vid,
+                }
+                track = create_track_from_cached_meta(dummy_file, {"title": test_vid, "video_id": test_vid})
+                self.assertEqual(track["title"], "Resolved Song Title")
+                self.assertEqual(track["uploader"], "Resolved Artist")
+
+    def test_cmd_skip_and_playback_controls_song_link_formatting(self):
+        """Verify skip, pause, resume and stop format song titles with markdown links."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        import discord
+        from discord.ext import commands
+
+        bot = DiscordVoiceBot()
+        intents = discord.Intents.default()
+        bot.client = commands.Bot(command_prefix="!", intents=intents)
+        bot._register_slash_commands()
+
+        commands_map = {cmd.name: cmd for cmd in bot.client.tree.get_commands()}
+        self.assertIn("skip", commands_map)
+        self.assertIn("pause", commands_map)
+        self.assertIn("resume", commands_map)
+
+        # Setup active playback with track containing webpage_url
+        test_track = {
+            "title": "Link Song",
+            "webpage_url": "https://www.youtube.com/watch?v=linksong123",
+        }
+        bot.is_playing = True
+        bot.current_track = test_track
+        bot.current_title = test_track["title"]
+        bot.voice_client = MagicMock()
+        bot.voice_client.is_playing.return_value = True
+        bot.voice_client.is_paused.return_value = False
+
+        # Test cmd_pause
+        mock_interaction = MagicMock()
+        mock_interaction.guild = None
+        mock_interaction.response.send_message = AsyncMock()
+        asyncio.run(commands_map["pause"].callback(mock_interaction))
+        mock_interaction.response.send_message.assert_called_once()
+        pause_content = mock_interaction.response.send_message.call_args[0][0]
+        self.assertIn("**[Link Song](<https://www.youtube.com/watch?v=linksong123>)**", pause_content)
+
+        # Test cmd_resume
+        bot.voice_client.is_paused.return_value = True
+        mock_interaction.response.send_message.reset_mock()
+        asyncio.run(commands_map["resume"].callback(mock_interaction))
+        mock_interaction.response.send_message.assert_called_once()
+        resume_content = mock_interaction.response.send_message.call_args[0][0]
+        self.assertIn("**[Link Song](<https://www.youtube.com/watch?v=linksong123>)**", resume_content)
+
+        # Test cmd_skip
+        bot.is_playing = True
+        mock_interaction.response.send_message.reset_mock()
+        asyncio.run(commands_map["skip"].callback(mock_interaction))
+        mock_interaction.response.send_message.assert_called_once()
+        skip_content = mock_interaction.response.send_message.call_args[0][0]
+        self.assertIn("**[Link Song](<https://www.youtube.com/watch?v=linksong123>)**", skip_content)
+
+    def test_skip_advances_queue_and_sets_manual_skip(self):
+        """Verify skip sets _manual_skip and advances queue cleanly."""
+        bot = DiscordVoiceBot()
+        bot.is_playing = True
+        bot.current_title = "Song 1"
+        bot.current_track = {"title": "Song 1", "webpage_url": "https://youtube.com/watch?v=s1"}
+        bot.voice_client = MagicMock()
+        bot.voice_client.is_playing.return_value = True
+
+        # When skip is called, voice_client.stop() is executed and _manual_skip is True
+        skipped = bot.skip()
+        self.assertEqual(skipped, "Song 1")
+        self.assertTrue(bot._manual_skip)
+        bot.voice_client.stop.assert_called_once()
+
+        # If voice_client is not actively playing, skip advances queue directly
+        bot.voice_client.is_playing.return_value = False
+        bot.voice_client.is_paused.return_value = False
+        bot.voice_client.is_connected.return_value = True
+        bot._loop = MagicMock()
+        bot._loop.is_running.return_value = True
+        bot.queue = [{"title": "Song 2", "webpage_url": "https://youtube.com/watch?v=s2"}]
+        bot._async_play_track = AsyncMock()
+
+        skipped2 = bot.skip()
+        self.assertEqual(skipped2, "Song 1")
+        self.assertEqual(len(bot.queue), 0)
+
+    def test_format_song_link_and_query_fallback(self):
+        """Verify format_song_link creates valid clickable links and handles queries cleanly."""
+        from engine.discord_bot import format_song_link
+
+        # Standard YouTube URL
+        self.assertEqual(
+            format_song_link("The Rare Occasions - Notion", "https://www.youtube.com/watch?v=PD1EXJScA6k"),
+            "**[The Rare Occasions - Notion](<https://www.youtube.com/watch?v=PD1EXJScA6k>)**",
+        )
+
+        # YouTube URL with search/share params (&pp=...)
+        self.assertEqual(
+            format_song_link("Notion", "https://www.youtube.com/watch?v=PD1EXJScA6k&pp=ygUbVGhlIFJhcmUgT2NjYXNpb25zIC0gTm90aW9u"),
+            "**[Notion](<https://www.youtube.com/watch?v=PD1EXJScA6k&pp=ygUbVGhlIFJhcmUgT2NjYXNpb25zIC0gTm90aW9u>)**",
+        )
+
+        # Raw 11-char video ID string
+        self.assertEqual(
+            format_song_link("Notion", "PD1EXJScA6k"),
+            "**[Notion](<https://www.youtube.com/watch?v=PD1EXJScA6k>)**",
+        )
+
+        # Plain search query (not an HTTP URL or video ID)
+        self.assertEqual(
+            format_song_link("The Rare Occasions - Notion", "notion rare occassion"),
+            "**The Rare Occasions - Notion**",
+        )
+
+        # Empty or None URL
+        self.assertEqual(
+            format_song_link("The Rare Occasions - Notion", ""),
+            "**The Rare Occasions - Notion**",
+        )
+
+    def test_cached_meta_sanitization(self):
+        """Verify create_track_from_cached_meta never stores non-HTTP query text in webpage_url."""
+        from engine.discord_bot import create_track_from_cached_meta
+
+        corrupt_meta = {
+            "title": "The Rare Occasions - Notion",
+            "video_id": "PD1EXJScA6k",
+            "webpage_url": "notion rare occassion",
+            "duration_sec": 195,
+        }
+        track = create_track_from_cached_meta("cache/PD1EXJScA6k.webm", corrupt_meta)
+        self.assertEqual(track["webpage_url"], "https://www.youtube.com/watch?v=PD1EXJScA6k")
+
+    def test_skip_with_autoplay_shows_next_song(self):
+        """Verify that skipping when autoplay is on displays 'Now playing <song>' for the chosen cached song."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import asyncio
+        import discord
+        from discord.ext import commands
+
+        bot = DiscordVoiceBot()
+        intents = discord.Intents.default()
+        bot.client = commands.Bot(command_prefix="!", intents=intents)
+        bot._register_slash_commands()
+
+        commands_map = {cmd.name: cmd for cmd in bot.client.tree.get_commands()}
+        self.assertIn("skip", commands_map)
+
+        bot.is_playing = True
+        bot.autoplay = True
+        bot.current_track = {
+            "title": "Current Song",
+            "webpage_url": "https://www.youtube.com/watch?v=curr123",
+        }
+        bot.current_title = "Current Song"
+        bot.voice_client = MagicMock()
+        bot.voice_client.is_playing.return_value = True
+        bot.voice_client.is_paused.return_value = False
+        bot.voice_client.is_connected.return_value = True
+        bot.queue = []
+
+        fake_cached = (
+            "cache/testvid123.webm",
+            {
+                "title": "Autoplay Song",
+                "webpage_url": "https://www.youtube.com/watch?v=testvid123",
+                "uploader": "Test Artist",
+                "duration_str": "3:30",
+            },
+        )
+
+        with patch("engine.discord_bot.AUDIO_CACHE_INDEX.get_random_track", return_value=fake_cached):
+            mock_interaction = MagicMock()
+            mock_interaction.guild = None
+            mock_interaction.response.send_message = AsyncMock()
+
+            asyncio.run(commands_map["skip"].callback(mock_interaction))
+
+            mock_interaction.response.send_message.assert_called_once()
+            msg_content = mock_interaction.response.send_message.call_args[0][0]
+
+            self.assertIn("Skipped **[Current Song](<https://www.youtube.com/watch?v=curr123>)**", msg_content)
+            self.assertIn("Now playing **[Autoplay Song](<https://www.youtube.com/watch?v=testvid123>)**", msg_content)
+            self.assertIn("by **Test Artist**", msg_content)
+            self.assertIn("(`3:30`)", msg_content)
+
 
 if __name__ == "__main__":
     unittest.main()
-
-
-
-

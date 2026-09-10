@@ -5,10 +5,7 @@ Supports interactive terminal mode and background daemon mode.
 
 import argparse
 import os
-import signal
 import sys
-import threading
-import time
 from typing import Optional
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -61,6 +58,7 @@ def print_help():
     print("  pause                 - Pause playback")
     print("  resume                - Resume playback")
     print("  stop                  - Stop playback and clear queue")
+    print("  a, autoplay [on/off]  - Toggle or set autoplay (plays random cache songs)")
     print("  v, vol <0-150>        - Set playback volume percentage")
     print("  help                  - Show this help list")
     print("  exit, quit            - Disconnect and exit\n")
@@ -225,9 +223,16 @@ def main():
                 bot.play_music(arg)
 
             elif cmd in ("s", "skip"):
+                next_track = bot.get_next_track() if hasattr(bot, "get_next_track") else (bot.queue[0] if bot.queue else None)
                 skipped = bot.skip()
                 if skipped:
-                    print(f"Skipped: {skipped}")
+                    if next_track:
+                        t_title = next_track.get("title", "Unknown")
+                        t_up = f" by {next_track['uploader']}" if next_track.get("uploader") else ""
+                        t_dur = f" [{next_track['duration_str']}]" if next_track.get("duration_str") else ""
+                        print(f"Skipped: {skipped}\nNow playing: {t_title}{t_up}{t_dur}")
+                    else:
+                        print(f"Skipped: {skipped}\nQueue is now empty.")
                 else:
                     print("Nothing currently playing.")
 
@@ -252,6 +257,19 @@ def main():
                     for i, t in enumerate(q, 1):
                         print(f"  {i}. {t['title']} [{t['duration_str']}] ({t['requester']})")
                     print("-----------------------------")
+
+            elif cmd in ("a", "autoplay"):
+                if not arg:
+                    status = "ON" if bot.autoplay else "OFF"
+                    print(f"Autoplay is currently: {status}")
+                elif arg.lower() in ("on", "1", "true", "enable"):
+                    bot.set_autoplay(True)
+                    print("Autoplay enabled (will play random cached songs when queue ends).")
+                elif arg.lower() in ("off", "0", "false", "disable"):
+                    bot.set_autoplay(False)
+                    print("Autoplay disabled.")
+                else:
+                    print("Usage: autoplay [on/off]")
 
             elif cmd in ("v", "vol", "volume"):
                 if not arg:

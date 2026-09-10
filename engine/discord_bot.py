@@ -8,7 +8,6 @@ import asyncio
 import html
 import json
 import os
-import queue
 import random
 import re
 import subprocess
@@ -16,8 +15,9 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 import warnings
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import aiohttp
 import discord
@@ -148,6 +148,7 @@ def get_random_server_emoji(guild: Optional[discord.Guild]) -> str:
         if custom_emojis:
             return str(random.choice(custom_emojis))
     return random.choice(["🎵", "🎶", "🎧", "✨"])
+
 
 
 def to_unicode_bold(text: str) -> str:
@@ -419,6 +420,76 @@ def extract_youtube_video_id(url_or_query: str) -> Optional[str]:
     return None
 
 
+def format_song_link(title: str, url: str) -> str:
+    """Format song title as a clickable Discord markdown link if a valid HTTP(S) URL is present."""
+    t = (title or "").strip() or "Song"
+    u = (url or "").strip()
+    if not (u.startswith("http://") or u.startswith("https://")):
+        vid = extract_youtube_video_id(u)
+        if vid:
+            u = f"https://www.youtube.com/watch?v={vid}"
+    if u and (u.startswith("http://") or u.startswith("https://")):
+        return f"**[{t}](<{u}>)**"
+    return f"**{t}**"
+
+
+def fetch_youtube_oembed_meta(vid_id: str) -> Optional[Dict[str, any]]:
+    """Fetch video title and author name from official YouTube oEmbed API without cookies."""
+    if not vid_id or len(vid_id) < 5:
+        return None
+    url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={vid_id}&format=json"
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            },
+        )
+        with urllib.request.urlopen(req, timeout=4.0) as resp:
+            if resp.status == 200:
+                raw_data = resp.read()
+                data = json.loads(raw_data.decode("utf-8", errors="replace"))
+                title = data.get("title", "").strip()
+                author = data.get("author_name", "").strip()
+                if title:
+                    return {
+                        "title": title,
+                        "uploader": author,
+                        "webpage_url": f"https://www.youtube.com/watch?v={vid_id}",
+                        "video_id": vid_id,
+                    }
+    except Exception:
+        pass
+    return None
+
+
+def get_audio_file_duration(filepath: str) -> Tuple[int, str]:
+    """Extract audio duration in seconds and formatted string using ffmpeg binary."""
+    if not filepath or not os.path.exists(filepath):
+        return 0, ""
+    try:
+        proc = subprocess.run(
+            [FFMPEG_EXECUTABLE, "-i", filepath],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=3,
+        )
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", proc.stderr or "")
+        if m:
+            hrs = int(m.group(1))
+            mins = int(m.group(2))
+            secs = int(float(m.group(3)))
+            total_sec = hrs * 3600 + mins * 60 + secs
+            dur_str = f"{total_sec // 60}:{total_sec % 60:02d}"
+            return total_sec, dur_str
+    except Exception:
+        pass
+    return 0, ""
+
+
 class AudioCacheIndex:
     """
     High-Performance In-Memory RAM Cache Index.
@@ -458,6 +529,7 @@ class AudioCacheIndex:
                     break
 
         new_index = {}
+        missing_meta_items = []
         for vid_id, af_path in audio_files.items():
             meta = None
             if vid_id in json_files:
@@ -468,8 +540,9 @@ class AudioCacheIndex:
                 except Exception:
                     meta = None
 
-            if not meta:
-                meta = {
+            is_raw = (not meta) or (meta.get("title") == vid_id) or bool(re.match(r"^[A-Za-z0-9_-]{11}$", meta.get("title", "")))
+            if not meta or is_raw:
+                meta = meta or {
                     "title": vid_id,
                     "uploader": "",
                     "duration_sec": 0,
@@ -477,6 +550,7 @@ class AudioCacheIndex:
                     "webpage_url": f"https://www.youtube.com/watch?v={vid_id}",
                     "video_id": vid_id,
                 }
+                missing_meta_items.append((vid_id, af_path, meta))
 
             new_index[vid_id] = {
                 "filepath": af_path,
@@ -510,6 +584,16 @@ class AudioCacheIndex:
                     self._index.pop(vid_id, None)
             self._loaded_dirs.add(cache_dir)
 
+        # Asynchronously resolve missing metadata in the background
+        if missing_meta_items:
+            def _bg_resolve():
+                for m_vid, m_af, m_meta in missing_meta_items:
+                    resolved = resolve_track_metadata(cache_dir, m_vid, m_meta, m_af)
+                    with self._lock:
+                        if m_vid in self._index:
+                            self._index[m_vid]["meta"] = resolved
+            threading.Thread(target=_bg_resolve, daemon=True).start()
+
     def _load_single_track(self, cache_dir: str, vid_id: str) -> Tuple[Optional[str], Optional[Dict[str, any]]]:
         """Scan disk for a newly created or single audio track if not present in RAM."""
         if not os.path.exists(cache_dir) or not vid_id:
@@ -539,15 +623,8 @@ class AudioCacheIndex:
             except Exception:
                 meta = None
 
-        if not meta:
-            meta = {
-                "title": vid_id,
-                "uploader": "",
-                "duration_sec": 0,
-                "duration_str": "",
-                "webpage_url": f"https://www.youtube.com/watch?v={vid_id}",
-                "video_id": vid_id,
-            }
+        if not meta or meta.get("title") == vid_id or re.match(r"^[A-Za-z0-9_-]{11}$", meta.get("title", "")):
+            meta = resolve_track_metadata(cache_dir, vid_id, meta, filepath=cached_file)
 
         return cached_file, meta
 
@@ -564,13 +641,21 @@ class AudioCacheIndex:
             if entry:
                 af_path = entry["filepath"]
                 if os.path.exists(af_path):
-                    return af_path, dict(entry["meta"])
+                    meta = dict(entry["meta"])
+                    title = meta.get("title", "").strip()
+                    if not title or title == vid_id or re.match(r"^[A-Za-z0-9_-]{11}$", title):
+                        meta = resolve_track_metadata(cache_dir, vid_id, meta, af_path)
+                        entry["meta"] = meta
+                    return af_path, dict(meta)
                 else:
                     self._index.pop(vid_id, None)
 
         # Fallback to single track disk check (handles external file additions/tests)
         cached_f, meta = self._load_single_track(cache_dir, vid_id)
         if cached_f and meta:
+            title = meta.get("title", "").strip()
+            if not title or title == vid_id or re.match(r"^[A-Za-z0-9_-]{11}$", title):
+                meta = resolve_track_metadata(cache_dir, vid_id, meta, cached_f)
             self.put(cache_dir, vid_id, meta, cached_f)
             return cached_f, dict(meta)
 
@@ -638,6 +723,67 @@ class AudioCacheIndex:
 
         return None, None
 
+    def get_random_track(
+        self, cache_dir: str, exclude_vid_id: Optional[str] = None
+    ) -> Optional[Tuple[str, Dict[str, any]]]:
+        """Return a random cached track (filepath, meta), optionally excluding exclude_vid_id. Returns None if no cached tracks exist."""
+        if not os.path.exists(cache_dir):
+            return None
+
+        if cache_dir not in self._loaded_dirs or not self._index:
+            self.sync_from_disk(cache_dir)
+
+        audio_exts = (".opus", ".webm", ".m4a", ".mp3", ".ogg", ".wav", ".flac", ".aac")
+
+        with self._lock:
+            valid_candidates = []
+            for vid_id, entry in list(self._index.items()):
+                fp = entry.get("filepath", "")
+                if fp and os.path.exists(fp) and os.path.getsize(fp) > 1024:
+                    meta_copy = dict(entry.get("meta", {}))
+                    meta_copy.setdefault("video_id", vid_id)
+                    valid_candidates.append((vid_id, fp, meta_copy))
+                else:
+                    self._index.pop(vid_id, None)
+
+            if not valid_candidates:
+                # Fallback: scan disk directory directly if index was empty
+                try:
+                    for fname in os.listdir(cache_dir):
+                        if fname.endswith(audio_exts):
+                            vid = os.path.splitext(fname)[0]
+                            fp = os.path.join(cache_dir, fname)
+                            if os.path.isfile(fp) and os.path.getsize(fp) > 1024:
+                                meta_f = os.path.join(cache_dir, f"{vid}.json")
+                                meta = {}
+                                if os.path.exists(meta_f):
+                                    try:
+                                        with open(meta_f, "r", encoding="utf-8") as jf:
+                                            meta = json.load(jf)
+                                    except Exception:
+                                        pass
+                                if not meta:
+                                    meta = {"title": vid, "video_id": vid}
+                                self._index[vid] = {"filepath": fp, "meta": meta}
+                                valid_candidates.append((vid, fp, meta))
+                except Exception:
+                    pass
+
+            if not valid_candidates:
+                return None
+
+            filtered = [c for c in valid_candidates if c[0] != exclude_vid_id]
+            pool = filtered if filtered else valid_candidates
+            chosen = random.choice(pool)
+            chosen_vid, chosen_fp, chosen_meta = chosen
+            title = chosen_meta.get("title", "").strip()
+            if not title or title == chosen_vid or re.match(r"^[A-Za-z0-9_-]{11}$", title):
+                chosen_meta = resolve_track_metadata(cache_dir, chosen_vid, chosen_meta, chosen_fp)
+                with self._lock:
+                    if chosen_vid in self._index:
+                        self._index[chosen_vid]["meta"] = chosen_meta
+            return chosen_fp, chosen_meta
+
     def put(self, cache_dir: str, vid_id: str, meta: Dict[str, any], audio_path: str):
         """Immediately update RAM cache index."""
         if not vid_id or not audio_path:
@@ -660,6 +806,17 @@ class AudioCacheIndex:
             self._index.clear()
             self._loaded_dirs.clear()
 
+    def count(self, cache_dir: Optional[str] = None) -> int:
+        """Return total number of cached tracks in the index."""
+        if cache_dir and cache_dir not in self._loaded_dirs:
+            self.sync_from_disk(cache_dir)
+        with self._lock:
+            return len(self._index)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._index)
+
 
 AUDIO_CACHE_INDEX = AudioCacheIndex()
 
@@ -678,6 +835,56 @@ def find_cached_track_by_query(cache_dir: str, query: str) -> Tuple[Optional[str
     Serviced directly from in-memory RAM cache (<0.05 ms).
     """
     return AUDIO_CACHE_INDEX.search_by_query(cache_dir, query)
+
+
+def create_track_from_cached_meta(
+    cached_file: str,
+    cached_meta: Dict[str, any],
+    requester: str = "Autoplay",
+    emoji: str = "",
+) -> Dict[str, any]:
+    """Construct a standardized playback track dictionary from cached metadata."""
+    if not emoji:
+        emoji = get_random_server_emoji(None)
+    target_vid = (
+        cached_meta.get("video_id")
+        or extract_youtube_video_id(cached_meta.get("webpage_url", ""))
+        or (os.path.splitext(os.path.basename(cached_file))[0] if cached_file else "")
+        or ""
+    )
+    cache_dir = os.path.dirname(cached_file) if cached_file else ""
+    title = cached_meta.get("title", "").strip()
+    if (not title or title == target_vid or re.match(r"^[A-Za-z0-9_-]{11}$", title)) and target_vid:
+        cached_meta = resolve_track_metadata(cache_dir, target_vid, cached_meta, cached_file)
+
+    sec = cached_meta.get("duration_sec", 0) or 0
+    dur_str = cached_meta.get("duration_str") or (f"{sec // 60}:{sec % 60:02d}" if sec else "Live")
+    title = cached_meta.get("title") or target_vid or "Cached Audio"
+    uploader = cached_meta.get("uploader", "")
+
+    raw_w_url = cached_meta.get("webpage_url", "")
+    if raw_w_url and str(raw_w_url).startswith(("http://", "https://")):
+        final_web_url = str(raw_w_url)
+    elif target_vid:
+        final_web_url = f"https://www.youtube.com/watch?v={target_vid}"
+    else:
+        final_web_url = ""
+
+    return {
+        "filepath": cached_file,
+        "url": cached_file,
+        "title": title,
+        "uploader": uploader,
+        "duration_sec": sec,
+        "duration_str": dur_str,
+        "webpage_url": final_web_url,
+        "video_id": target_vid,
+        "requester": requester,
+        "http_headers": {},
+        "is_stream": False,
+        "timestamp": time.time(),
+        "emoji": emoji,
+    }
 
 
 def save_track_cache_meta(cache_dir: str, vid_id: str, meta: Dict[str, any]):
@@ -702,6 +909,87 @@ def save_track_cache_meta(cache_dir: str, vid_id: str, meta: Dict[str, any]):
             json.dump(meta, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[DiscordBot] Notice: failed to save track cache meta for {vid_id}: {e}")
+
+
+def resolve_track_metadata(
+    cache_dir: str,
+    vid_id: str,
+    existing_meta: Optional[Dict[str, any]] = None,
+    filepath: Optional[str] = None,
+) -> Dict[str, any]:
+    """
+    Ensure complete track metadata (title, uploader, duration).
+    Self-heals via YouTube oEmbed and ffmpeg if title is missing, equal to video ID, or a raw 11-char ID.
+    """
+    meta = dict(existing_meta or {})
+    title = meta.get("title", "").strip()
+    uploader = meta.get("uploader", "").strip()
+    sec = meta.get("duration_sec", 0) or 0
+    dur_str = meta.get("duration_str", "").strip()
+
+    is_raw_id = (not title) or (title == vid_id) or bool(re.match(r"^[A-Za-z0-9_-]{11}$", title))
+    needs_save = False
+
+    if is_raw_id and vid_id:
+        oembed = fetch_youtube_oembed_meta(vid_id)
+        if oembed:
+            new_title = oembed.get("title", "").strip()
+            if new_title:
+                title = new_title
+                needs_save = True
+            new_uploader = oembed.get("uploader", "").strip()
+            if new_uploader and not uploader:
+                uploader = new_uploader
+                needs_save = True
+
+    if (not sec or not dur_str or dur_str in ("Live", "0:00")) and filepath and os.path.exists(filepath):
+        f_sec, f_dur = get_audio_file_duration(filepath)
+        if f_sec:
+            sec = f_sec
+            dur_str = f_dur
+            needs_save = True
+
+    if not dur_str:
+        dur_str = f"{sec // 60}:{sec % 60:02d}" if sec else "Live"
+
+    raw_w_url = meta.get("webpage_url", "")
+    if raw_w_url and str(raw_w_url).startswith(("http://", "https://")):
+        final_web_url = str(raw_w_url)
+    elif vid_id:
+        final_web_url = f"https://www.youtube.com/watch?v={vid_id}"
+    else:
+        final_web_url = ""
+
+    resolved = {
+        "title": title or vid_id,
+        "uploader": uploader,
+        "duration_sec": sec,
+        "duration_str": dur_str,
+        "webpage_url": final_web_url,
+        "video_id": vid_id,
+    }
+
+    if needs_save and cache_dir and os.path.exists(cache_dir):
+        try:
+            save_track_cache_meta(cache_dir, vid_id, resolved)
+        except Exception:
+            pass
+
+    return resolved
+
+
+def ensure_track_title(track: Dict[str, any], cache_dir: str = AUDIO_CACHE_DIR) -> str:
+    """Ensure track dictionary has resolved title instead of raw 11-char video ID."""
+    if not track:
+        return ""
+    title = (track.get("title") or "").strip()
+    vid = track.get("video_id") or extract_youtube_video_id(track.get("webpage_url", ""))
+    if (not title or title == vid or bool(re.match(r"^[A-Za-z0-9_-]{11}$", title))) and vid:
+        resolved = resolve_track_metadata(cache_dir, vid, track)
+        if resolved.get("title") and resolved.get("title") != vid:
+            title = resolved["title"]
+            track["title"] = title
+    return title or "Music"
 
 
 def prune_audio_cache(
@@ -891,7 +1179,6 @@ def resolve_song_info(query_or_url: str) -> Tuple[bool, str, str]:
     Returns: (success, resolved_title, canonical_url)
     """
     try:
-        from engine.security import sanitize_audio_target
         target = normalize_youtube_url(query_or_url)
         is_safe, sanitized_target, _ = sanitize_audio_target(target)
         if not is_safe:
@@ -1061,6 +1348,11 @@ class DiscordVoiceBot:
         self._idle_since: Optional[float] = None
         self._auto_leave_task: Optional[asyncio.Task] = None
 
+        # Autoplay setting (play random cached track when queue is empty)
+        self.autoplay: bool = os.environ.get("AUTOPLAY_ENABLED", "false").lower() in ("true", "1", "yes")
+        self._manual_stop: bool = False
+        self._manual_skip: bool = False
+
     def record_user_history(self, user_id: Union[int, str], track: Dict[str, any]):
         """Record a played/enqueued song to user history (max 25 songs, FIFO with deduplication)."""
         uid = str(user_id)
@@ -1070,6 +1362,12 @@ class DiscordVoiceBot:
         title = track.get("title") or "Unknown Title"
         uploader = track.get("uploader") or ""
         url = track.get("webpage_url") or track.get("url") or ""
+        if not (str(url).startswith("http://") or str(url).startswith("https://")):
+            vid = track.get("video_id") or extract_youtube_video_id(url)
+            if vid:
+                url = f"https://www.youtube.com/watch?v={vid}"
+            else:
+                url = ""
         dur = track.get("duration_str") or ""
 
         entry = {
@@ -1276,7 +1574,9 @@ class DiscordVoiceBot:
 
             try:
                 await self._ensure_voice_connected(channel)
-                await interaction.followup.send(f"Connected to **#{channel.name}**")
+                emoji = get_random_server_emoji(interaction.guild)
+                prefix = f"{emoji} " if emoji else ""
+                await interaction.followup.send(f"{prefix}Connected to **#{channel.name}**")
             except Exception as e:
                 print(f"[DiscordBot] Error connecting to voice channel: {e}")
                 await interaction.followup.send(f"Failed to connect to voice channel: {e}")
@@ -1329,7 +1629,7 @@ class DiscordVoiceBot:
                 uploader = track.get("uploader", "")
                 url = track.get("webpage_url", "")
 
-                link_part = f"**[{title}](<{url}>)**" if url else f"**{title}**"
+                link_part = format_song_link(title, url)
                 uploader_part = f" by **{uploader}**" if uploader else ""
                 dur_part = f" (`{dur}`)" if dur else ""
 
@@ -1420,35 +1720,49 @@ class DiscordVoiceBot:
 
         @bot.tree.command(name="skip", description="Skip the currently playing track")
         async def cmd_skip(interaction: discord.Interaction):
-            if not self.is_playing and not self.is_paused:
+            is_active = (
+                (self.voice_client and (self.voice_client.is_playing() or self.voice_client.is_paused()))
+                or self.is_playing
+                or bool(self.current_track)
+            )
+            if not is_active and not self.queue:
                 await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
                 return
 
-            old_title = self.current_title
-            next_track = self.queue[0] if self.queue else None
+            old_track = self.current_track
+            old_title = ensure_track_title(old_track) if old_track else self.current_title
+            old_url = old_track.get("webpage_url", "") if old_track else ""
+            old_link = format_song_link(old_title, old_url)
+            next_track = self.get_next_track(guild=interaction.guild)
+
             self.skip()
 
+            emoji = get_random_server_emoji(interaction.guild)
+            prefix = f"{emoji} " if emoji else ""
+
             if next_track:
-                next_title = next_track.get("title", "Next Track")
+                next_title = ensure_track_title(next_track)
                 next_url = next_track.get("webpage_url", "")
                 next_dur = next_track.get("duration_str", "Live")
                 next_uploader = next_track.get("uploader", "")
 
-                next_link = f"**[{next_title}](<{next_url}>)**" if next_url else f"**{next_title}**"
+                next_link = format_song_link(next_title, next_url)
                 next_up = f" by **{next_uploader}**" if next_uploader else ""
                 next_dur_part = f" (`{next_dur}`)" if next_dur else ""
 
-                next_emoji = (next_track.get("emoji") if next_track else None) or get_random_server_emoji(interaction.guild)
-                prefix = f"{next_emoji} " if next_emoji else ""
+                track_emoji = next_track.get("emoji") or emoji
+                track_prefix = f"{track_emoji} " if track_emoji else ""
 
-                await interaction.response.send_message(
-                    f"{prefix}Skipped **{old_title}**.\nNow playing {next_link}{next_up}{next_dur_part}.",
-                    suppress_embeds=True,
-                )
+                msg = f"{track_prefix}Skipped {old_link}.\nNow playing {next_link}{next_up}{next_dur_part}."
+            elif self.autoplay:
+                msg = f"{prefix}Skipped {old_link}. Autoplay is active, but no cached tracks were found in cache/."
             else:
-                await interaction.response.send_message(
-                    f"Skipped **{old_title}**. The queue is now empty."
-                )
+                msg = f"{prefix}Skipped {old_link}. The queue is now empty."
+
+            if hasattr(interaction.response, "is_done") and callable(interaction.response.is_done) and interaction.response.is_done() is True:
+                await interaction.followup.send(msg, suppress_embeds=True)
+            else:
+                await interaction.response.send_message(msg, suppress_embeds=True)
 
         @bot.tree.command(name="queue", description="Display the current song queue")
         async def cmd_queue(interaction: discord.Interaction):
@@ -1463,7 +1777,7 @@ class DiscordVoiceBot:
                 c_dur = self.current_track.get("duration_str", "Live")
                 c_up = self.current_track.get("uploader", "")
 
-                cur_link = f"**[{c_title}](<{c_url}>)**" if c_url else f"**{c_title}**"
+                cur_link = format_song_link(c_title, c_url)
                 cur_up = f" by **{c_up}**" if c_up else ""
                 cur_dur = f" (`{c_dur}`)" if c_dur else ""
 
@@ -1479,10 +1793,10 @@ class DiscordVoiceBot:
                     t_dur = t.get("duration_str", "Live")
                     t_up = t.get("uploader", "")
 
-                    t_link = f"**[{t_title}](<{t_url}>)**" if t_url else f"**{t_title}**"
+                    t_link = format_song_link(t_title, t_url)
                     t_up_part = f" by **{t_up}**" if t_up else ""
                     t_dur_part = f" (`{t_dur}`)" if t_dur else ""
-                    t_emoji = t.get("emoji")
+                    t_emoji = t.get("emoji") or get_random_server_emoji(interaction.guild)
                     t_prefix = f"{t_emoji} " if t_emoji else ""
                     lines.append(f"`{i}.` {t_prefix}{t_link}{t_up_part}{t_dur_part}")
                 if len(self.queue) > 10:
@@ -1493,44 +1807,185 @@ class DiscordVoiceBot:
         @bot.tree.command(name="clear", description="Clear all songs from the queue")
         async def cmd_clear(interaction: discord.Interaction):
             count = self.clear_queue()
-            await interaction.response.send_message(f"Cleared {count} tracks from the queue.")
+            emoji = get_random_server_emoji(interaction.guild)
+            prefix = f"{emoji} " if emoji else ""
+            await interaction.response.send_message(f"{prefix}Cleared {count} tracks from the queue.")
 
         @bot.tree.command(name="pause", description="Pause the currently playing track")
         async def cmd_pause(interaction: discord.Interaction):
             if self.voice_client and self.voice_client.is_playing():
+                cur_track = self.current_track
+                cur_title = cur_track.get("title", self.current_title) if cur_track else self.current_title
+                cur_url = cur_track.get("webpage_url", "") if cur_track else ""
+                cur_link = format_song_link(cur_title, cur_url)
                 self.pause()
-                await interaction.response.send_message("Playback paused.")
+                emoji = get_random_server_emoji(interaction.guild)
+                prefix = f"{emoji} " if emoji else ""
+                await interaction.response.send_message(f"{prefix}Playback paused for {cur_link}.", suppress_embeds=True)
             else:
                 await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
 
         @bot.tree.command(name="resume", description="Resume paused playback")
         async def cmd_resume(interaction: discord.Interaction):
             if self.voice_client and self.voice_client.is_paused():
+                cur_track = self.current_track
+                cur_title = cur_track.get("title", self.current_title) if cur_track else self.current_title
+                cur_url = cur_track.get("webpage_url", "") if cur_track else ""
+                cur_link = format_song_link(cur_title, cur_url)
                 self.resume()
-                await interaction.response.send_message("Playback resumed.")
+                emoji = get_random_server_emoji(interaction.guild)
+                prefix = f"{emoji} " if emoji else ""
+                await interaction.response.send_message(f"{prefix}Playback resumed for {cur_link}.", suppress_embeds=True)
             else:
                 await interaction.response.send_message("Playback is not paused.", ephemeral=True)
 
         @bot.tree.command(name="stop", description="Stop playback and clear the queue")
         async def cmd_stop(interaction: discord.Interaction):
+            cur_track = self.current_track
+            cur_title = cur_track.get("title", self.current_title) if cur_track else ""
+            cur_url = cur_track.get("webpage_url", "") if cur_track else ""
+            cur_link = f" for {format_song_link(cur_title, cur_url)}" if (cur_title and cur_title != "No audio playing") else ""
             self.stop_playback()
-            await interaction.response.send_message("Playback stopped and queue cleared.")
+            emoji = get_random_server_emoji(interaction.guild)
+            prefix = f"{emoji} " if emoji else ""
+            await interaction.response.send_message(f"{prefix}Playback stopped{cur_link} and queue cleared.", suppress_embeds=True)
 
         @bot.tree.command(name="volume", description="Adjust playback volume (0% - 150%)")
         @app_commands.describe(percentage="Volume percentage (e.g. 100)")
         async def cmd_volume(interaction: discord.Interaction, percentage: int):
             vol = max(0, min(150, percentage)) / 100.0
             self.set_volume(vol)
-            await interaction.response.send_message(f"Volume set to `{percentage}%`.")
+            emoji = get_random_server_emoji(interaction.guild)
+            prefix = f"{emoji} " if emoji else ""
+            await interaction.response.send_message(f"{prefix}Volume set to `{percentage}%`.")
 
         @bot.tree.command(name="leave", description="Disconnect the bot from the voice channel")
         async def cmd_leave(interaction: discord.Interaction):
             guild_vc = getattr(interaction.guild, "voice_client", None) if interaction.guild else None
             if (self.voice_client and self.voice_client.is_connected()) or guild_vc:
                 self.leave_voice_channel()
-                await interaction.response.send_message("Disconnected from voice channel.")
+                emoji = get_random_server_emoji(interaction.guild)
+                prefix = f"{emoji} " if emoji else ""
+                await interaction.response.send_message(f"{prefix}Disconnected from voice channel.")
             else:
                 await interaction.response.send_message("Bot is not in a voice channel.", ephemeral=True)
+
+        class AutoplaySelect(discord.ui.Select):
+            def __init__(ui_self, current_autoplay: bool):
+                options = [
+                    discord.SelectOption(
+                        label="Autoplay ON",
+                        value="on",
+                        description="Plays random cached songs when queue ends",
+                        emoji="▶️",
+                        default=current_autoplay,
+                    ),
+                    discord.SelectOption(
+                        label="Autoplay OFF",
+                        value="off",
+                        description="Playback stops when queue ends",
+                        emoji="⏹️",
+                        default=not current_autoplay,
+                    ),
+                ]
+                super().__init__(placeholder="Choose autoplay mode...", min_values=1, max_values=1, options=options)
+
+            async def callback(ui_self, select_interaction: discord.Interaction):
+                await select_interaction.response.defer()
+                chosen_val = ui_self.values[0]
+                if chosen_val == "on":
+                    res_msg = await bot_enable_autoplay(select_interaction)
+                else:
+                    self.set_autoplay(False)
+                    emoji = get_random_server_emoji(select_interaction.guild)
+                    prefix = f"{emoji} " if emoji else ""
+                    res_msg = f"{prefix}Autoplay is now **OFF**. Playback will stop when the queue is empty."
+
+                new_view = AutoplaySelectView(self.autoplay)
+                await select_interaction.edit_original_response(content=res_msg, view=new_view)
+
+        class AutoplaySelectView(discord.ui.View):
+            def __init__(ui_self, current_autoplay: bool):
+                super().__init__(timeout=180)
+                ui_self.add_item(AutoplaySelect(current_autoplay))
+
+        async def bot_enable_autoplay(interaction: discord.Interaction) -> str:
+            self.set_autoplay(True, trigger=False)
+            emoji = get_random_server_emoji(interaction.guild)
+            prefix = f"{emoji} " if emoji else ""
+
+            is_active = (self.voice_client and (self.voice_client.is_playing() or self.voice_client.is_paused())) or self.is_playing
+
+            if is_active and self.current_track:
+                cur_title = ensure_track_title(self.current_track)
+                self.current_title = cur_title
+                cur_url = self.current_track.get("webpage_url", "")
+                cur_link = format_song_link(cur_title, cur_url)
+                return f"{prefix}Autoplay is now **ON**.\nCurrently playing {cur_link}. When the queue ends, random songs from cache will play automatically."
+
+            # If not currently playing but bot is connected in a voice channel with empty queue:
+            if self.voice_client and self.voice_client.is_connected() and not self.queue:
+                started_track = self.trigger_autoplay()
+                if started_track and isinstance(started_track, dict):
+                    t_title = ensure_track_title(started_track)
+                    t_url = started_track.get("webpage_url", "")
+                    t_link = format_song_link(t_title, t_url)
+                    return f"{prefix}Autoplay is now **ON**.\nNow playing {t_link} from cache!"
+
+            return f"{prefix}Autoplay is now **ON**.\nWhen the queue ends, random songs from cache will play automatically."
+
+        @bot.tree.command(
+            name="autoplay",
+            description="Control autoplay mode (plays random songs from cache when queue ends)",
+        )
+        @app_commands.describe(mode="Choose whether autoplay is on or off")
+        @app_commands.choices(
+            mode=[
+                app_commands.Choice(name="on", value="on"),
+                app_commands.Choice(name="off", value="off"),
+            ]
+        )
+        async def cmd_autoplay(interaction: discord.Interaction, mode: Optional[str] = None):
+            await interaction.response.defer(ephemeral=False)
+            try:
+                if mode == "on":
+                    msg = await bot_enable_autoplay(interaction)
+                    await interaction.followup.send(msg, suppress_embeds=True)
+                elif mode == "off":
+                    self.set_autoplay(False)
+                    emoji = get_random_server_emoji(interaction.guild)
+                    prefix = f"{emoji} " if emoji else ""
+                    msg = f"{prefix}Autoplay is now **OFF**. Playback will stop when the queue is empty."
+                    await interaction.followup.send(msg)
+                else:
+                    current_state = "ON" if self.autoplay else "OFF"
+                    emoji = get_random_server_emoji(interaction.guild)
+                    prefix = f"{emoji} " if emoji else ""
+                    msg = (
+                        f"{prefix}Autoplay is currently **{current_state}**.\n"
+                        "Choose an option below to change autoplay mode:"
+                    )
+                    view = AutoplaySelectView(self.autoplay)
+                    await interaction.followup.send(msg, view=view)
+            except Exception as e:
+                print(f"[DiscordBot] Error in cmd_autoplay: {e}")
+                try:
+                    await interaction.followup.send(f"Error handling autoplay: {e}", ephemeral=True)
+                except Exception:
+                    pass
+
+        @bot.tree.error
+        async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+            cmd_name = interaction.command.name if interaction.command else "unknown"
+            print(f"[DiscordBot] AppCommand error on /{cmd_name}: {error}")
+            try:
+                msg = f"Command error on `/{cmd_name}`: {error}"
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+            except Exception:
+                pass
 
     def _run_bot(self, token: str):
         """Asyncio event loop runner."""
@@ -1816,7 +2271,7 @@ class DiscordVoiceBot:
             if not (sanitized_target.startswith("http://") or sanitized_target.startswith("https://")):
                 sanitized_target = f"ytsearch1:{sanitized_target}"
 
-            cache_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cache"))
+            cache_dir = AUDIO_CACHE_DIR
             os.makedirs(cache_dir, exist_ok=True)
 
             # --- Instant Cache Bypass: Instant Playback for Cached Songs ---
@@ -1835,22 +2290,37 @@ class DiscordVoiceBot:
                 except OSError:
                     pass
 
+                target_vid = cached_meta.get("video_id") or vid_id or extract_youtube_video_id(cached_meta.get("webpage_url", "")) or ""
+                title = cached_meta.get("title", "").strip()
+                if (not title or title == target_vid or re.match(r"^[A-Za-z0-9_-]{11}$", title)) and target_vid:
+                    cached_meta = resolve_track_metadata(cache_dir, target_vid, cached_meta, cached_file)
+
                 if not emoji:
                     guild = getattr(self.voice_client, "guild", None) if self.voice_client else None
                     emoji = get_random_server_emoji(guild)
 
                 sec = cached_meta.get("duration_sec", 0) or 0
                 dur_str = cached_meta.get("duration_str") or (f"{sec // 60}:{sec % 60:02d}" if sec else "Live")
-                target_vid = cached_meta.get("video_id") or vid_id or extract_youtube_video_id(cached_meta.get("webpage_url", "")) or ""
+                title = cached_meta.get("title", target_vid or query_or_url)
+                uploader = cached_meta.get("uploader", "")
+
+                raw_w_url = cached_meta.get("webpage_url", "")
+                if raw_w_url and str(raw_w_url).startswith(("http://", "https://")):
+                    final_cached_url = str(raw_w_url)
+                elif target_vid:
+                    final_cached_url = f"https://www.youtube.com/watch?v={target_vid}"
+                else:
+                    final_cached_url = ""
 
                 track = {
                     "filepath": cached_file,
                     "url": cached_file,
-                    "title": cached_meta.get("title", target_vid or query_or_url),
-                    "uploader": cached_meta.get("uploader", ""),
+                    "title": title,
+                    "uploader": uploader,
                     "duration_sec": sec,
                     "duration_str": dur_str,
-                    "webpage_url": cached_meta.get("webpage_url", f"https://www.youtube.com/watch?v={target_vid}" if target_vid else ""),
+                    "webpage_url": final_cached_url,
+                    "video_id": target_vid,
                     "requester": requester,
                     "http_headers": {},
                     "is_stream": False,
@@ -2024,6 +2494,24 @@ class DiscordVoiceBot:
                 guild = getattr(self.voice_client, "guild", None) if self.voice_client else None
                 emoji = get_random_server_emoji(guild)
 
+            target_vid = (
+                data.get("id")
+                or vid_id
+                or extract_youtube_video_id(data.get("webpage_url", ""))
+                or extract_youtube_video_id(data.get("url", ""))
+                or extract_youtube_video_id(query_or_url)
+                or ""
+            )
+            raw_w_url = data.get("webpage_url", "")
+            if raw_w_url and str(raw_w_url).startswith(("http://", "https://")):
+                final_web_url = str(raw_w_url)
+            elif target_vid:
+                final_web_url = f"https://www.youtube.com/watch?v={target_vid}"
+            elif query_or_url.startswith(("http://", "https://")):
+                final_web_url = query_or_url
+            else:
+                final_web_url = ""
+
             track = {
                 "filepath": filepath,
                 "url": direct_url,
@@ -2031,7 +2519,8 @@ class DiscordVoiceBot:
                 "uploader": uploader,
                 "duration_sec": sec,
                 "duration_str": dur_str,
-                "webpage_url": data.get("webpage_url", query_or_url),
+                "webpage_url": final_web_url,
+                "video_id": target_vid,
                 "requester": requester,
                 "http_headers": http_headers or data.get("http_headers", {}),
                 "is_stream": filepath is None,
@@ -2040,14 +2529,13 @@ class DiscordVoiceBot:
             }
 
             # Save metadata and enforce storage limits asynchronously to eliminate event loop lag
-            target_vid = data.get("id") or vid_id or extract_youtube_video_id(data.get("webpage_url", ""))
             if target_vid and filepath and os.path.exists(filepath):
                 meta_dict = {
                     "title": title,
                     "uploader": uploader,
                     "duration_sec": sec,
                     "duration_str": dur_str,
-                    "webpage_url": data.get("webpage_url", f"https://www.youtube.com/watch?v={target_vid}"),
+                    "webpage_url": final_web_url or f"https://www.youtube.com/watch?v={target_vid}",
                     "video_id": target_vid,
                 }
                 def _bg_persist():
@@ -2080,6 +2568,7 @@ class DiscordVoiceBot:
             if self.voice_client.is_playing() or self.voice_client.is_paused():
                 self.voice_client.stop()
 
+            ensure_track_title(track)
             self.current_track = track
             self.current_title = track["title"]
 
@@ -2141,40 +2630,45 @@ class DiscordVoiceBot:
             play_start_time = time.time()
 
             def _after_play(error):
+                is_skipped = getattr(self, "_manual_skip", False)
+                self._manual_skip = False
+                is_stopped = getattr(self, "_manual_stop", False)
+
                 actual_error = error
-                if not actual_error and hasattr(source, "_current_error") and source._current_error:
-                    actual_error = source._current_error
+                if not is_skipped and not is_stopped:
+                    if not actual_error and hasattr(source, "_current_error") and source._current_error:
+                        actual_error = source._current_error
 
-                # Also inspect process returncode if process terminated with non-zero
-                proc = getattr(source, "_process", None)
-                if proc is not None:
-                    try:
-                        proc_ret = proc.poll()
-                        if proc_ret is None:
-                            proc_ret = proc.wait(timeout=0.5)
-                        if proc_ret is not None and proc_ret != 0:
-                            actual_error = actual_error or f"FFmpeg exited with code {proc_ret}"
-                    except Exception:
-                        pass
+                    # Also inspect process returncode if process terminated with non-zero
+                    proc = getattr(source, "_process", None)
+                    if proc is not None:
+                        try:
+                            proc_ret = proc.poll()
+                            if proc_ret is None:
+                                proc_ret = proc.wait(timeout=0.5)
+                            if proc_ret is not None and proc_ret != 0:
+                                actual_error = actual_error or f"FFmpeg exited with code {proc_ret}"
+                        except Exception:
+                            pass
 
-                # Also detect premature exit: if a stream stopped in < 3.0s for a song with duration > 10s
-                duration_sec = track.get("duration_sec", 0)
-                elapsed = time.time() - play_start_time
-                if not actual_error and track.get("is_stream") and (duration_sec == 0 or duration_sec > 10) and elapsed < 3.0:
-                    actual_error = f"Stream ended prematurely after {elapsed:.1f}s"
+                    # Also detect premature exit: if a stream stopped in < 3.0s for a song with duration > 10s
+                    duration_sec = track.get("duration_sec", 0)
+                    elapsed = time.time() - play_start_time
+                    if not actual_error and track.get("is_stream") and (duration_sec == 0 or duration_sec > 10) and elapsed < 3.0:
+                        actual_error = f"Stream ended prematurely after {elapsed:.1f}s"
 
-                if actual_error:
-                    print(f"[DiscordBot] Playback error: {actual_error}")
-                    self._notify_status("ERROR", f"Playback error: {actual_error}")
+                    if actual_error:
+                        print(f"[DiscordBot] Playback error: {actual_error}")
+                        self._notify_status("ERROR", f"Playback error: {actual_error}")
 
-                # If direct stream failed immediately, fallback automatically to download mode
-                if actual_error and track.get("is_stream") and not track.get("_retried_as_download"):
-                    print(f"[DiscordBot] Stream encountered error ({actual_error}), falling back to download for: {track.get('title')}")
-                    track["_retried_as_download"] = True
+                    # If direct stream failed immediately, fallback automatically to download mode
+                    if actual_error and track.get("is_stream") and not track.get("_retried_as_download"):
+                        print(f"[DiscordBot] Stream encountered error ({actual_error}), falling back to download for: {track.get('title')}")
+                        track["_retried_as_download"] = True
                     if self._loop and self._loop.is_running():
                         async def _fallback_download():
                             try:
-                                cache_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cache"))
+                                cache_dir = AUDIO_CACHE_DIR
                                 os.makedirs(cache_dir, exist_ok=True)
                                 dl_opts = dict(YTDL_OPTIONS)
                                 dl_opts["outtmpl"] = os.path.join(cache_dir, "%(id)s.%(ext)s")
@@ -2247,8 +2741,23 @@ class DiscordVoiceBot:
                         os.utime(cached_f, None)
                     except OSError:
                         pass
-                    cache_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cache"))
+                    cache_dir = AUDIO_CACHE_DIR
                     threading.Thread(target=prune_audio_cache, args=(cache_dir,), daemon=True).start()
+
+                if is_stopped:
+                    self._manual_stop = False
+                    self.is_playing = False
+                    self.is_paused = False
+                    self.current_track = None
+                    self.current_title = "No audio playing"
+                    self._idle_since = time.time()
+                    self._notify_status("PLAYBACK_STOPPED", "")
+                    self._notify_status("QUEUE_UPDATED", "")
+                    if self._loop and self._loop.is_running():
+                        asyncio.run_coroutine_threadsafe(
+                            self._update_voice_channel_status("Waiting for song requests"), self._loop
+                        )
+                    return
 
                 # Check if there are songs waiting in the queue
                 if self.queue and self.voice_client and self.voice_client.is_connected():
@@ -2256,6 +2765,31 @@ class DiscordVoiceBot:
                     self._notify_status("QUEUE_UPDATED", "")
                     if self._loop and self._loop.is_running():
                         asyncio.run_coroutine_threadsafe(self._async_play_track(next_song), self._loop)
+                elif self.autoplay and self.voice_client and self.voice_client.is_connected():
+                    cache_dir = AUDIO_CACHE_DIR
+                    curr_vid = track.get("video_id") or extract_youtube_video_id(track.get("webpage_url", ""))
+                    random_cached = AUDIO_CACHE_INDEX.get_random_track(cache_dir, exclude_vid_id=curr_vid)
+                    if random_cached:
+                        cached_file, cached_meta = random_cached
+                        auto_emoji = get_random_server_emoji(self.voice_client.guild if self.voice_client else None)
+                        auto_track = create_track_from_cached_meta(cached_file, cached_meta, requester="Autoplay", emoji=auto_emoji)
+                        ensure_track_title(auto_track)
+                        print(f"[DiscordBot] Autoplay selecting random track from cache: {auto_track.get('title')}")
+                        if self._loop and self._loop.is_running():
+                            asyncio.run_coroutine_threadsafe(self._async_play_track(auto_track), self._loop)
+                    else:
+                        print("[DiscordBot] Autoplay active, but no cached songs found in cache/. Stopping playback.")
+                        self.is_playing = False
+                        self.is_paused = False
+                        self.current_track = None
+                        self.current_title = "No audio playing"
+                        self._idle_since = time.time()
+                        self._notify_status("PLAYBACK_STOPPED", "")
+                        self._notify_status("QUEUE_UPDATED", "")
+                        if self._loop and self._loop.is_running():
+                            asyncio.run_coroutine_threadsafe(
+                                self._update_voice_channel_status("Waiting for song requests"), self._loop
+                            )
                 else:
                     self.is_playing = False
                     self.is_paused = False
@@ -2326,10 +2860,49 @@ class DiscordVoiceBot:
 
     def skip(self) -> Optional[str]:
         """Skip currently playing track and advance queue."""
+        old_title = self.current_title
+        self._manual_skip = True
+
         if self.voice_client and (self.voice_client.is_playing() or self.voice_client.is_paused()):
-            old_title = self.current_title
             self.voice_client.stop()
             return old_title
+        elif self.queue and self.voice_client and self.voice_client.is_connected() and self._loop and self._loop.is_running():
+            next_song = self.queue.pop(0)
+            self._notify_status("QUEUE_UPDATED", "")
+            asyncio.run_coroutine_threadsafe(self._async_play_track(next_song), self._loop)
+            return old_title
+        elif self.autoplay and self.voice_client and self.voice_client.is_connected() and self._loop and self._loop.is_running():
+            self.trigger_autoplay()
+            return old_title
+        elif self.current_track or self.is_playing:
+            self.is_playing = False
+            self.is_paused = False
+            self.current_track = None
+            self.current_title = "No audio playing"
+            return old_title
+        return None
+
+    def get_next_track(self, guild: Optional[discord.Guild] = None) -> Optional[Dict[str, any]]:
+        """
+        Return the upcoming track to be played.
+        If the queue is empty but autoplay is active, pre-select and enqueue a random cached track
+        so that the upcoming track is known in advance and guaranteed to play.
+        """
+        if self.queue:
+            return self.queue[0]
+        if self.autoplay and self.voice_client and (not hasattr(self.voice_client, "is_connected") or (callable(self.voice_client.is_connected) and self.voice_client.is_connected())):
+            cache_dir = AUDIO_CACHE_DIR
+            curr_vid = ""
+            if self.current_track:
+                curr_vid = self.current_track.get("video_id") or extract_youtube_video_id(self.current_track.get("webpage_url", ""))
+            random_cached = AUDIO_CACHE_INDEX.get_random_track(cache_dir, exclude_vid_id=curr_vid)
+            if random_cached:
+                cached_file, cached_meta = random_cached
+                auto_emoji = get_random_server_emoji(guild)
+                auto_track = create_track_from_cached_meta(cached_file, cached_meta, requester="Autoplay", emoji=auto_emoji)
+                ensure_track_title(auto_track)
+                self.queue.append(auto_track)
+                return auto_track
         return None
 
     def clear_queue(self) -> int:
@@ -2370,6 +2943,7 @@ class DiscordVoiceBot:
 
     def stop_playback(self):
         """Stop current audio playback and clear queue."""
+        self._manual_stop = True
         self.queue.clear()
         self.current_track = None
         if self.voice_client and (self.voice_client.is_playing() or self.voice_client.is_paused()):
@@ -2393,3 +2967,39 @@ class DiscordVoiceBot:
                 self.voice_client.source.volume = self.volume
             except Exception:
                 pass
+
+    def set_autoplay(self, enabled: bool, trigger: bool = False) -> bool:
+        """Enable or disable autoplay mode."""
+        self.autoplay = bool(enabled)
+        if self.autoplay and trigger:
+            if self.voice_client and self.voice_client.is_connected() and not self.is_playing and not self.queue:
+                if not self.voice_client.is_playing() and not self.voice_client.is_paused():
+                    self.trigger_autoplay()
+        return self.autoplay
+
+    def trigger_autoplay(self) -> Optional[Dict[str, any]]:
+        """Attempt to play a random cached track if autoplay is enabled and bot is idle."""
+        if not self.autoplay:
+            return None
+        if not self.voice_client or not self.voice_client.is_connected():
+            return None
+        if self.is_playing or self.is_paused or self.queue:
+            return None
+        if self.voice_client.is_playing() or self.voice_client.is_paused():
+            return None
+
+        cache_dir = AUDIO_CACHE_DIR
+        curr_vid = ""
+        if self.current_track:
+            curr_vid = self.current_track.get("video_id") or extract_youtube_video_id(self.current_track.get("webpage_url", ""))
+        random_cached = AUDIO_CACHE_INDEX.get_random_track(cache_dir, exclude_vid_id=curr_vid)
+        if random_cached:
+            cached_file, cached_meta = random_cached
+            auto_emoji = get_random_server_emoji(self.voice_client.guild if self.voice_client else None)
+            auto_track = create_track_from_cached_meta(cached_file, cached_meta, requester="Autoplay", emoji=auto_emoji)
+            ensure_track_title(auto_track)
+            print(f"[DiscordBot] Autoplay starting random cached track: {auto_track.get('title')}")
+            if self._loop and self._loop.is_running():
+                asyncio.run_coroutine_threadsafe(self._async_play_track(auto_track), self._loop)
+            return auto_track
+        return None

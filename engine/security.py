@@ -7,13 +7,12 @@ Security and process isolation utilities for Woeyyy Discord Bot:
 """
 
 import ctypes
-import json
 import os
 import re
 import subprocess
 import sys
 from ctypes import wintypes
-from typing import List, Optional, Tuple
+from typing import Tuple
 from urllib.parse import urlparse
 
 MUTEX_NAME = "Local\\Woeyyy_Discord_Bot_SingleInstance_Mutex"
