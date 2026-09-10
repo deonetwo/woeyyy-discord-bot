@@ -5,7 +5,10 @@ Supports interactive terminal mode and background daemon mode.
 
 import argparse
 import os
+import signal
 import sys
+import threading
+import time
 from typing import Optional
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))

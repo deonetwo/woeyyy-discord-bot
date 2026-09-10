@@ -8,6 +8,7 @@ import asyncio
 import html
 import json
 import os
+import queue
 import random
 import re
 import subprocess
@@ -36,7 +37,6 @@ warnings.filterwarnings("ignore", message=".*Python version 3\\..*")
 
 from engine.security import (
     secure_file_permissions,
-    mask_token,
     sanitize_audio_target,
 )
 
@@ -122,11 +122,6 @@ YTDL_OPTIONS = {
 COOKIE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cookies.txt"))
 if os.path.exists(COOKIE_PATH):
     YTDL_OPTIONS["cookiefile"] = COOKIE_PATH
-
-FFMPEG_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
-}
 
 
 def normalize_youtube_url(query: str) -> str:
@@ -357,11 +352,10 @@ async def async_search_youtube_suggestions(
     return items
 
 
-
 ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env"))
 CONFIG_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".bot_config.json"))
-USER_HISTORY_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cache", "user_history.json"))
 AUDIO_CACHE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cache"))
+USER_HISTORY_PATH = os.path.join(AUDIO_CACHE_DIR, "user_history.json")
 DEFAULT_MAX_CACHE_MB = 500
 DEFAULT_MAX_CACHE_FILES = 50
 
@@ -1170,33 +1164,6 @@ def save_token(token: str):
                 pass
     except Exception as e:
         print(f"[DiscordBot] Failed to save token to .env: {e}")
-
-
-def resolve_song_info(query_or_url: str) -> Tuple[bool, str, str]:
-    """
-    Resolve real track title and canonical URL using yt-dlp.
-    Can run standalone without needing an active Discord bot gateway session.
-    Returns: (success, resolved_title, canonical_url)
-    """
-    try:
-        target = normalize_youtube_url(query_or_url)
-        is_safe, sanitized_target, _ = sanitize_audio_target(target)
-        if not is_safe:
-            return False, query_or_url, query_or_url
-
-        if not (sanitized_target.startswith("http://") or sanitized_target.startswith("https://")):
-            sanitized_target = f"ytsearch1:{sanitized_target}"
-
-        with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
-            data = ydl.extract_info(sanitized_target, download=False)
-            if "entries" in data and data["entries"]:
-                data = data["entries"][0]
-            title = data.get("title", query_or_url)
-            url = data.get("webpage_url") or data.get("url") or sanitized_target
-            return True, title, url
-    except Exception as e:
-        print(f"[DiscordBot] Notice: could not resolve song metadata: {e}")
-        return False, query_or_url, query_or_url
 
 
 class BufferedAudioSource(discord.AudioSource):

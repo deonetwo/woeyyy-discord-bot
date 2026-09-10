@@ -1,6 +1,5 @@
 """Unit tests for engine/security.py."""
 
-import os
 import unittest
 from engine.security import (
     SingleInstanceLock,

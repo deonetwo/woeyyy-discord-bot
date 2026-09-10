@@ -14,7 +14,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from engine.discord_bot import (
-    AUDIO_CACHE_INDEX,
     AudioCacheIndex,
     BufferedAudioSource,
     DiscordVoiceBot,
