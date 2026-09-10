@@ -4,6 +4,7 @@ Verifies bot controller initialization, configuration storage,
 FFmpeg binary presence, and thread lifecycle.
 """
 
+import asyncio
 import json
 import os
 import sys
@@ -1194,6 +1195,55 @@ class TestDiscordVoiceBot(unittest.TestCase):
             self.assertIn("Now playing **[Autoplay Song](<https://www.youtube.com/watch?v=testvid123>)**", msg_content)
             self.assertIn("by **Test Artist**", msg_content)
             self.assertIn("(`3:30`)", msg_content)
+
+    def test_autoplay_triggers_on_natural_song_completion(self):
+        """Verify when a song completes naturally with autoplay enabled, next random track is played."""
+        bot = DiscordVoiceBot(is_local=False)
+        bot.autoplay = True
+        bot._loop = MagicMock()
+        bot._loop.is_running.return_value = True
+        bot.voice_client = MagicMock()
+        bot.voice_client.is_connected.return_value = True
+        bot.queue = []
+
+        fake_cached = (
+            "cache/next_rand_vid.webm",
+            {
+                "title": "Next Random Song",
+                "webpage_url": "https://www.youtube.com/watch?v=next_rand_vid",
+                "uploader": "Random Artist",
+                "duration_str": "4:00",
+                "video_id": "next_rand_vid",
+            },
+        )
+
+        current_track = {
+            "title": "Finished Song",
+            "webpage_url": "https://www.youtube.com/watch?v=finished_vid",
+            "video_id": "finished_vid",
+            "is_stream": False,
+        }
+
+        captured_after = None
+        def mock_play(source, after=None):
+            nonlocal captured_after
+            captured_after = after
+
+        bot.voice_client.play = mock_play
+
+        with patch("engine.discord_bot.get_ffmpeg_binary", return_value="ffmpeg"), \
+             patch("engine.discord_bot.discord.FFmpegPCMAudio"), \
+             patch("engine.discord_bot.BufferedAudioSource"), \
+             patch("engine.discord_bot.discord.PCMVolumeTransformer"):
+            asyncio.run(bot._async_play_track(current_track))
+
+        self.assertIsNotNone(captured_after, "_after_play callback must be registered with voice_client.play")
+
+        with patch("engine.discord_bot.AUDIO_CACHE_INDEX.get_random_track", return_value=fake_cached) as mock_get_rand, \
+             patch("engine.discord_bot.asyncio.run_coroutine_threadsafe") as mock_run_coro:
+            captured_after(None)
+            mock_get_rand.assert_called_once()
+            mock_run_coro.assert_called_once()
 
 
 if __name__ == "__main__":

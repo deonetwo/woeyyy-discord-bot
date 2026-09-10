@@ -2632,74 +2632,74 @@ class DiscordVoiceBot:
                     if actual_error and track.get("is_stream") and not track.get("_retried_as_download"):
                         print(f"[DiscordBot] Stream encountered error ({actual_error}), falling back to download for: {track.get('title')}")
                         track["_retried_as_download"] = True
-                    if self._loop and self._loop.is_running():
-                        async def _fallback_download():
-                            try:
-                                cache_dir = AUDIO_CACHE_DIR
-                                os.makedirs(cache_dir, exist_ok=True)
-                                dl_opts = dict(YTDL_OPTIONS)
-                                dl_opts["outtmpl"] = os.path.join(cache_dir, "%(id)s.%(ext)s")
-                                dl_opts["noplaylist"] = True
+                        if self._loop and self._loop.is_running():
+                            async def _fallback_download():
                                 try:
-                                    ytdl_dl = yt_dlp.YoutubeDL(dl_opts)
-                                    fallback_data = await self._loop.run_in_executor(
-                                        None, lambda: ytdl_dl.extract_info(track["webpage_url"], download=True)
-                                    )
-                                except Exception as dl_err:
-                                    if "cookiefile" in dl_opts:
-                                        print(f"[DiscordBot] Fallback download with cookies failed ({dl_err}), retrying without cookies...")
-                                        clean_dl_opts = {
-                                            "format": "bestaudio/best",
-                                            "outtmpl": os.path.join(cache_dir, "%(id)s.%(ext)s"),
-                                            "noplaylist": True,
-                                            "quiet": True,
-                                            "source_address": "0.0.0.0",
-                                            "buffersize": 131072,
-                                            "http_chunk_size": 10485760,
-                                        }
-                                        ytdl_dl = yt_dlp.YoutubeDL(clean_dl_opts)
+                                    cache_dir = AUDIO_CACHE_DIR
+                                    os.makedirs(cache_dir, exist_ok=True)
+                                    dl_opts = dict(YTDL_OPTIONS)
+                                    dl_opts["outtmpl"] = os.path.join(cache_dir, "%(id)s.%(ext)s")
+                                    dl_opts["noplaylist"] = True
+                                    try:
+                                        ytdl_dl = yt_dlp.YoutubeDL(dl_opts)
                                         fallback_data = await self._loop.run_in_executor(
                                             None, lambda: ytdl_dl.extract_info(track["webpage_url"], download=True)
                                         )
-                                    else:
-                                        raise dl_err
+                                    except Exception as dl_err:
+                                        if "cookiefile" in dl_opts:
+                                            print(f"[DiscordBot] Fallback download with cookies failed ({dl_err}), retrying without cookies...")
+                                            clean_dl_opts = {
+                                                "format": "bestaudio/best",
+                                                "outtmpl": os.path.join(cache_dir, "%(id)s.%(ext)s"),
+                                                "noplaylist": True,
+                                                "quiet": True,
+                                                "source_address": "0.0.0.0",
+                                                "buffersize": 131072,
+                                                "http_chunk_size": 10485760,
+                                            }
+                                            ytdl_dl = yt_dlp.YoutubeDL(clean_dl_opts)
+                                            fallback_data = await self._loop.run_in_executor(
+                                                None, lambda: ytdl_dl.extract_info(track["webpage_url"], download=True)
+                                            )
+                                        else:
+                                            raise dl_err
 
-                                if fallback_data and "entries" in fallback_data and fallback_data["entries"]:
-                                    fallback_data = fallback_data["entries"][0]
-                                dl_filepath = ytdl_dl.prepare_filename(fallback_data)
-                                if not os.path.exists(dl_filepath):
-                                    vid_id = fallback_data.get("id", "")
-                                    for fname in os.listdir(cache_dir):
-                                        if fname.startswith(vid_id):
-                                            dl_filepath = os.path.join(cache_dir, fname)
-                                            break
-                                if dl_filepath and os.path.exists(dl_filepath):
-                                    track["filepath"] = dl_filepath
-                                    track["url"] = dl_filepath
-                                    track["is_stream"] = False
-                                    fb_vid = fallback_data.get("id") or extract_youtube_video_id(track.get("webpage_url", ""))
-                                    if fb_vid:
-                                        fb_meta = {
-                                            "title": track.get("title", fb_vid),
-                                            "uploader": track.get("uploader", ""),
-                                            "duration_sec": track.get("duration_sec", 0),
-                                            "duration_str": track.get("duration_str", ""),
-                                            "webpage_url": track.get("webpage_url", f"https://www.youtube.com/watch?v={fb_vid}"),
-                                            "video_id": fb_vid,
-                                        }
-                                        threading.Thread(
-                                            target=lambda: (
-                                                save_track_cache_meta(cache_dir, fb_vid, fb_meta),
-                                                prune_audio_cache(cache_dir),
-                                            ),
-                                            daemon=True,
-                                        ).start()
-                                    await self._async_play_track(track)
-                                    return
-                            except Exception as dl_err:
-                                print(f"[DiscordBot] Fallback download failed: {dl_err}")
-                        asyncio.run_coroutine_threadsafe(_fallback_download(), self._loop)
-                        return
+                                    if fallback_data and "entries" in fallback_data and fallback_data["entries"]:
+                                        fallback_data = fallback_data["entries"][0]
+                                    dl_filepath = ytdl_dl.prepare_filename(fallback_data)
+                                    if not os.path.exists(dl_filepath):
+                                        vid_id = fallback_data.get("id", "")
+                                        for fname in os.listdir(cache_dir):
+                                            if fname.startswith(vid_id):
+                                                dl_filepath = os.path.join(cache_dir, fname)
+                                                break
+                                    if dl_filepath and os.path.exists(dl_filepath):
+                                        track["filepath"] = dl_filepath
+                                        track["url"] = dl_filepath
+                                        track["is_stream"] = False
+                                        fb_vid = fallback_data.get("id") or extract_youtube_video_id(track.get("webpage_url", ""))
+                                        if fb_vid:
+                                            fb_meta = {
+                                                "title": track.get("title", fb_vid),
+                                                "uploader": track.get("uploader", ""),
+                                                "duration_sec": track.get("duration_sec", 0),
+                                                "duration_str": track.get("duration_str", ""),
+                                                "webpage_url": track.get("webpage_url", f"https://www.youtube.com/watch?v={fb_vid}"),
+                                                "video_id": fb_vid,
+                                            }
+                                            threading.Thread(
+                                                target=lambda: (
+                                                    save_track_cache_meta(cache_dir, fb_vid, fb_meta),
+                                                    prune_audio_cache(cache_dir),
+                                                ),
+                                                daemon=True,
+                                            ).start()
+                                        await self._async_play_track(track)
+                                        return
+                                except Exception as dl_err:
+                                    print(f"[DiscordBot] Fallback download failed: {dl_err}")
+                            asyncio.run_coroutine_threadsafe(_fallback_download(), self._loop)
+                            return
 
                 # Keep cached file for instant replay, but enforce LRU cache quota
                 cached_f = track.get("filepath")
