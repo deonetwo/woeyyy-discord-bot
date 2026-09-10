@@ -1319,6 +1319,35 @@ class DiscordVoiceBot:
         self.autoplay: bool = os.environ.get("AUTOPLAY_ENABLED", "false").lower() in ("true", "1", "yes")
         self._manual_stop: bool = False
         self._manual_skip: bool = False
+        self.last_text_channel: Optional[discord.abc.Messageable] = None
+
+    def _bind_text_channel(
+        self,
+        interaction: Optional[discord.Interaction] = None,
+        channel: Optional[discord.abc.Messageable] = None,
+    ):
+        """Track the most recent active Discord text channel for playback announcements."""
+        if channel:
+            self.last_text_channel = channel
+        elif interaction and interaction.channel:
+            self.last_text_channel = interaction.channel
+
+    def _get_announce_channel(self) -> Optional[discord.abc.Messageable]:
+        """Return the active text channel for now playing notifications, with fallback to guild channels."""
+        if self.last_text_channel:
+            return self.last_text_channel
+        if self.voice_client and self.voice_client.guild:
+            guild = self.voice_client.guild
+            me = guild.me
+            if guild.system_channel:
+                perms = guild.system_channel.permissions_for(me) if me else None
+                if not perms or perms.send_messages:
+                    return guild.system_channel
+            for ch in guild.text_channels:
+                perms = ch.permissions_for(me) if me else None
+                if not perms or perms.send_messages:
+                    return ch
+        return None
 
     def record_user_history(self, user_id: Union[int, str], track: Dict[str, any]):
         """Record a played/enqueued song to user history (max 25 songs, FIFO with deduplication)."""
@@ -1527,6 +1556,12 @@ class DiscordVoiceBot:
     def _register_slash_commands(self):
         """Register all slash commands (/) on the bot's command tree."""
         bot = self.client
+
+        async def _tree_interaction_check(interaction: discord.Interaction) -> bool:
+            self._bind_text_channel(interaction)
+            return True
+
+        bot.tree.interaction_check = _tree_interaction_check
 
         @bot.tree.command(name="join", description="Connect the bot to your current voice channel")
         async def cmd_join(interaction: discord.Interaction):
@@ -2525,7 +2560,7 @@ class DiscordVoiceBot:
             print(f"[DiscordBot] Failed to enqueue or play: {e}")
             return False, str(e), False, {}
 
-    async def _async_play_track(self, track: Dict[str, any]):
+    async def _async_play_track(self, track: Dict[str, any], announce: bool = False):
         """Play track on current voice_client (using direct stream URL or cached file)."""
         if not self.voice_client or not self.voice_client.is_connected():
             return
@@ -2731,7 +2766,10 @@ class DiscordVoiceBot:
                     next_song = self.queue.pop(0)
                     self._notify_status("QUEUE_UPDATED", "")
                     if self._loop and self._loop.is_running():
-                        asyncio.run_coroutine_threadsafe(self._async_play_track(next_song), self._loop)
+                        asyncio.run_coroutine_threadsafe(
+                            self._async_play_track(next_song, announce=not is_skipped),
+                            self._loop,
+                        )
                 elif self.autoplay and self.voice_client and self.voice_client.is_connected():
                     cache_dir = AUDIO_CACHE_DIR
                     curr_vid = track.get("video_id") or extract_youtube_video_id(track.get("webpage_url", ""))
@@ -2743,7 +2781,10 @@ class DiscordVoiceBot:
                         ensure_track_title(auto_track)
                         print(f"[DiscordBot] Autoplay selecting random track from cache: {auto_track.get('title')}")
                         if self._loop and self._loop.is_running():
-                            asyncio.run_coroutine_threadsafe(self._async_play_track(auto_track), self._loop)
+                            asyncio.run_coroutine_threadsafe(
+                                self._async_play_track(auto_track, announce=not is_skipped),
+                                self._loop,
+                            )
                     else:
                         print("[DiscordBot] Autoplay active, but no cached songs found in cache/. Stopping playback.")
                         self.is_playing = False
@@ -2793,6 +2834,24 @@ class DiscordVoiceBot:
             uploader = track.get("uploader", "")
             status_text = format_now_playing_status(emoji, title, uploader)
             await self._update_voice_channel_status(status_text)
+
+            # Announce next track to active text channel when advancing naturally
+            if announce:
+                target_channel = self._get_announce_channel()
+                if target_channel and hasattr(target_channel, "send"):
+                    try:
+                        link_part = format_song_link(title, track.get("webpage_url", ""))
+                        up_part = f" by **{uploader}**" if uploader else ""
+                        dur = track.get("duration_str", "")
+                        dur_part = f" (`{dur}`)" if dur else ""
+                        prefix = f"{emoji} " if emoji else ""
+                        msg = f"{prefix}Now playing {link_part}{up_part}{dur_part}."
+                        try:
+                            await target_channel.send(msg, suppress_embeds=True)
+                        except TypeError:
+                            await target_channel.send(msg)
+                    except Exception as send_err:
+                        print(f"[DiscordBot] Notice: could not send now playing announcement to text channel: {send_err}")
         except discord.opus.OpusNotLoaded:
             err_msg = "Opus library not found. Run: sudo apt install -y libopus0 libopus-dev"
             print(f"[DiscordBot] {err_msg}")

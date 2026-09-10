@@ -1237,13 +1237,36 @@ class TestDiscordVoiceBot(unittest.TestCase):
              patch("engine.discord_bot.discord.PCMVolumeTransformer"):
             asyncio.run(bot._async_play_track(current_track))
 
-        self.assertIsNotNone(captured_after, "_after_play callback must be registered with voice_client.play")
+        mock_channel = MagicMock()
+        mock_channel.send = AsyncMock()
+        bot.last_text_channel = mock_channel
 
         with patch("engine.discord_bot.AUDIO_CACHE_INDEX.get_random_track", return_value=fake_cached) as mock_get_rand, \
              patch("engine.discord_bot.asyncio.run_coroutine_threadsafe") as mock_run_coro:
             captured_after(None)
             mock_get_rand.assert_called_once()
             mock_run_coro.assert_called_once()
+
+        # Now test that playing with announce=True actually sends the Now Playing message to text channel
+        with patch("engine.discord_bot.get_ffmpeg_binary", return_value="ffmpeg"), \
+             patch("engine.discord_bot.discord.FFmpegPCMAudio"), \
+             patch("engine.discord_bot.BufferedAudioSource"), \
+             patch("engine.discord_bot.discord.PCMVolumeTransformer"):
+            next_track = {
+                "title": "Next Random Song",
+                "webpage_url": "https://www.youtube.com/watch?v=next_rand_vid",
+                "uploader": "Random Artist",
+                "duration_str": "4:00",
+                "video_id": "next_rand_vid",
+                "is_stream": False,
+            }
+            asyncio.run(bot._async_play_track(next_track, announce=True))
+
+            mock_channel.send.assert_awaited_once()
+            sent_msg = mock_channel.send.call_args[0][0]
+            self.assertIn("Now playing **[Next Random Song](<https://www.youtube.com/watch?v=next_rand_vid>)**", sent_msg)
+            self.assertIn("by **Random Artist**", sent_msg)
+            self.assertIn("(`4:00`)", sent_msg)
 
 
 if __name__ == "__main__":
