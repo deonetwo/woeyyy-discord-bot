@@ -19,7 +19,7 @@ import urllib.parse
 import urllib.request
 import warnings
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
 import discord
@@ -120,7 +120,7 @@ YTDL_OPTIONS = {
     "no_warnings": True,
     "default_search": "ytsearch1:",
     "source_address": "0.0.0.0",
-    "js_runtimes": {"deno": {}, "bun": {}},
+    "js_runtimes": {"bun": {}, "deno": {}},
 }
 
 # Path to optional cookies file (used strictly as on-demand fallback when YouTube requires authentication)
@@ -249,41 +249,37 @@ def format_paused_status(title: str, uploader: str = "") -> str:
     return text
 
 
-async def async_search_innertube_candidates(
+async def async_search_youtube_suggestions(
     query: str,
-    max_results: int = 5,
     session: Optional[aiohttp.ClientSession] = None,
-) -> List[Dict[str, Any]]:
+    max_results: int = 15,
+) -> List[Dict[str, str]]:
     """
-    Query YouTube's Innertube search API endpoint directly (~0.8s) to fetch candidate videos.
-    Returns a list of dicts: [{'id': vid, 'title': title, 'uploader': owner, 'duration': sec, 'duration_str': str, 'url': url, 'webpage_url': url}]
+    Asynchronously query YouTube's search endpoint to fetch matching video suggestions
+    for Discord slash command autocompletion.
+
+    Returns a list of dicts: [{"name": display_name, "value": direct_url}]
+    where name is formatted as '🎵 Channel - Title' (clamped to <= 100 chars) and value is the watch URL.
     """
     clean = query.strip()
     if not clean:
         return []
 
-    # If the user passed a direct URL, extract video ID if possible
+    # If the user is pasting a direct URL, suggest playing the URL directly
     if clean.startswith("http://") or clean.startswith("https://"):
-        vid = extract_youtube_video_id(clean)
-        if vid:
-            return [{
-                "id": vid,
-                "title": clean,
-                "uploader": "",
-                "duration": 0,
-                "duration_str": "",
-                "url": f"https://www.youtube.com/watch?v={vid}",
-                "webpage_url": f"https://www.youtube.com/watch?v={vid}",
-            }]
-        return []
+        url_label = clean
+        if len(url_label) > 90:
+            url_label = url_label[:87] + "..."
+        return [{"name": f"🔗 {url_label}", "value": clean}]
 
-    items: List[Dict[str, Any]] = []
+    items: List[Dict[str, str]] = []
     own_session = False
     if session is None or session.closed:
-        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2.5))
+        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2.0))
         own_session = True
 
     try:
+        # Primary search: YouTube Innertube search endpoint (returns exact video title + channel)
         url = "https://www.youtube.com/youtubei/v1/search?prettyPrint=false"
         payload = {
             "context": {
@@ -343,85 +339,27 @@ async def async_search_innertube_candidates(
                         if not title:
                             continue
 
-                        length_str = v.get("lengthText", {}).get("simpleText", "")
-                        duration_sec = 0
-                        if length_str:
-                            try:
-                                parts = [int(p) for p in length_str.split(":")]
-                                if len(parts) == 2:
-                                    duration_sec = parts[0] * 60 + parts[1]
-                                elif len(parts) == 3:
-                                    duration_sec = parts[0] * 3600 + parts[1] * 60 + parts[2]
-                            except Exception:
-                                duration_sec = 0
+                        # Format label: '🎵 Channel - Title' or '🎵 Title'
+                        if owner:
+                            label = f"🎵 {owner} - {title}"
+                        else:
+                            label = f"🎵 {title}"
 
-                        items.append({
-                            "id": vid,
-                            "title": title,
-                            "uploader": owner,
-                            "duration": duration_sec,
-                            "duration_str": length_str,
-                            "url": f"https://www.youtube.com/watch?v={vid}",
-                            "webpage_url": f"https://www.youtube.com/watch?v={vid}",
-                        })
+                        # Discord hard limit: Choice.name must be <= 100 characters
+                        if len(label) > 100:
+                            label = label[:97] + "..."
+
+                        val = f"https://www.youtube.com/watch?v={vid}"
+                        items.append({"name": label, "value": val})
                         if len(items) >= max_results:
                             break
                     if len(items) >= max_results:
                         break
-    except Exception as e:
-        logger.debug(f"Innertube candidate search notice for '{clean}': {e}")
-    finally:
-        if own_session and not session.closed:
-            await session.close()
-
-    return items
-
-
-async def async_search_youtube_suggestions(
-    query: str,
-    session: Optional[aiohttp.ClientSession] = None,
-    max_results: int = 15,
-) -> List[Dict[str, str]]:
-    """
-    Asynchronously query YouTube's search endpoint to fetch matching video suggestions
-    for Discord slash command autocompletion.
-
-    Returns a list of dicts: [{"name": display_name, "value": direct_url}]
-    where name is formatted as '🎵 Channel - Title' (clamped to <= 100 chars) and value is the watch URL.
-    """
-    clean = query.strip()
-    if not clean:
-        return []
-
-    # If the user is pasting a direct URL, suggest playing the URL directly
-    if clean.startswith("http://") or clean.startswith("https://"):
-        url_label = clean
-        if len(url_label) > 90:
-            url_label = url_label[:87] + "..."
-        return [{"name": f"🔗 {url_label}", "value": clean}]
-
-    items: List[Dict[str, str]] = []
-    candidates = await async_search_innertube_candidates(clean, max_results=max_results, session=session)
-    for c in candidates:
-        owner = c.get("uploader", "")
-        title = c.get("title", "")
-        if owner:
-            label = f"🎵 {owner} - {title}"
-        else:
-            label = f"🎵 {title}"
-
-        # Discord hard limit: Choice.name must be <= 100 characters
-        if len(label) > 100:
-            label = label[:97] + "..."
-
-        items.append({"name": label, "value": c["url"]})
+    except Exception:
+        pass
 
     # Secondary fallback: YouTube suggest queries endpoint if Innertube is empty
     if not items:
-        own_session = False
-        if session is None or session.closed:
-            session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2.0))
-            own_session = True
         try:
             suggest_url = (
                 f"https://suggestqueries.google.com/complete/search"
@@ -445,9 +383,9 @@ async def async_search_youtube_suggestions(
                                     break
         except Exception:
             pass
-        finally:
-            if own_session and not session.closed:
-                await session.close()
+
+    if own_session and not session.closed:
+        await session.close()
 
     return items
 
@@ -2741,48 +2679,31 @@ class DiscordVoiceBot:
                 res_vid = vid_id or extract_youtube_video_id(sanitized_target)
                 candidates = []
 
-                # 1. If searching by query (not a direct video URL), perform fast multi-candidate search
+                # 1. If searching by query (not a direct video URL), perform fast multi-candidate flat search
                 if not res_vid:
-                    raw_q = sanitized_target
-                    if raw_q.startswith("ytsearch5:"):
-                        raw_q = raw_q[10:]
-                    elif raw_q.startswith("ytsearch1:"):
-                        raw_q = raw_q[10:]
-                    elif ":" in raw_q and raw_q.startswith("ytsearch"):
-                        raw_q = raw_q.split(":", 1)[1]
+                    search_opts = dict(YTDL_OPTIONS)
+                    search_opts["noplaylist"] = True
+                    search_opts["extract_flat"] = True
 
-                    # Step 1A: Fast Innertube Search API (~0.8s)
+                    search_target = sanitized_target
+                    if search_target.startswith("ytsearch1:"):
+                        search_target = f"ytsearch5:{search_target[10:]}"
+                    elif not (search_target.startswith("http://") or search_target.startswith("https://") or search_target.startswith("ytsearch")):
+                        search_target = f"ytsearch5:{search_target}"
+
                     try:
-                        candidates = await async_search_innertube_candidates(raw_q, max_results=5)
-                    except Exception as it_err:
-                        logger.warning(f"Fast Innertube search notice ({it_err}), falling back to yt-dlp search...")
-                        candidates = []
+                        ytdl_search = yt_dlp.YoutubeDL(search_opts)
+                        data = await loop.run_in_executor(
+                            None, lambda: ytdl_search.extract_info(search_target, download=False)
+                        )
+                    except Exception as search_err:
+                        logger.warning(f"Search metadata extraction notice ({search_err}), proceeding to download...")
+                        data = None
 
-                    # Step 1B: Fallback to yt-dlp flat search (~2.2s) if Innertube returned no candidates
-                    if not candidates:
-                        search_opts = dict(YTDL_OPTIONS)
-                        search_opts["noplaylist"] = True
-                        search_opts["extract_flat"] = True
-
-                        search_target = sanitized_target
-                        if search_target.startswith("ytsearch1:"):
-                            search_target = f"ytsearch5:{search_target[10:]}"
-                        elif not (search_target.startswith("http://") or search_target.startswith("https://") or search_target.startswith("ytsearch")):
-                            search_target = f"ytsearch5:{search_target}"
-
-                        try:
-                            ytdl_search = yt_dlp.YoutubeDL(search_opts)
-                            data = await loop.run_in_executor(
-                                None, lambda: ytdl_search.extract_info(search_target, download=False)
-                            )
-                        except Exception as search_err:
-                            logger.warning(f"Search metadata extraction notice ({search_err}), proceeding to download...")
-                            data = None
-
-                        if data and "entries" in data:
-                            candidates = [e for e in data["entries"] if e]
-                        elif data:
-                            candidates = [data]
+                    if data and "entries" in data:
+                        candidates = [e for e in data["entries"] if e]
+                    elif data:
+                        candidates = [data]
 
                     # Filter candidates by title relevance if query has quotes
                     rel_candidates = [c for c in candidates if is_relevant_search_candidate(c.get("title", ""), query_or_url)]
@@ -2791,27 +2712,17 @@ class DiscordVoiceBot:
                     cleaned_q = clean_search_query(query_or_url)
                     if not rel_candidates and cleaned_q and cleaned_q.lower() != query_or_url.strip().lower():
                         try:
-                            clean_candidates = await async_search_innertube_candidates(cleaned_q, max_results=5)
-                            if not clean_candidates:
-                                clean_target = f"ytsearch5:{cleaned_q}"
-                                search_opts = dict(YTDL_OPTIONS)
-                                search_opts["noplaylist"] = True
-                                search_opts["extract_flat"] = True
-                                ytdl_clean = yt_dlp.YoutubeDL(search_opts)
-                                data_clean = await loop.run_in_executor(
-                                    None, lambda: ytdl_clean.extract_info(clean_target, download=False)
-                                )
-                                if data_clean and "entries" in data_clean:
-                                    clean_candidates = [e for e in data_clean["entries"] if e]
-
-                            if clean_candidates:
+                            clean_target = f"ytsearch5:{cleaned_q}"
+                            data_clean = await loop.run_in_executor(
+                                None, lambda: ytdl_search.extract_info(clean_target, download=False)
+                            )
+                            if data_clean and "entries" in data_clean:
                                 existing_ids = {c.get("id") for c in candidates if c.get("id")}
-                                for c in clean_candidates:
-                                    c_id = c.get("id") or extract_youtube_video_id(c.get("url", "")) or extract_youtube_video_id(c.get("webpage_url", ""))
-                                    if c_id and c_id not in existing_ids:
+                                for c in data_clean["entries"]:
+                                    if c and c.get("id") and c.get("id") not in existing_ids:
                                         if is_relevant_search_candidate(c.get("title", ""), cleaned_q):
                                             rel_candidates.append(c)
-                                            existing_ids.add(c_id)
+                                            existing_ids.add(c.get("id"))
                         except Exception as clean_err:
                             logger.info(f"Clean query search notice: {clean_err}")
 
@@ -2883,7 +2794,7 @@ class DiscordVoiceBot:
                         try:
                             ytdl_dl = yt_dlp.YoutubeDL(dl_opts)
                             dl_data = await loop.run_in_executor(
-                                None, lambda: ytdl_dl.extract_info(dl_target, download=False)
+                                None, lambda: ytdl_dl.extract_info(dl_target, download=True)
                             )
                             if dl_data:
                                 data = dl_data
@@ -2904,7 +2815,7 @@ class DiscordVoiceBot:
                                 try:
                                     ytdl_clean = yt_dlp.YoutubeDL(clean_dl_opts)
                                     dl_data = await loop.run_in_executor(
-                                        None, lambda: ytdl_clean.extract_info(dl_target, download=False)
+                                        None, lambda: ytdl_clean.extract_info(dl_target, download=True)
                                     )
                                     if dl_data:
                                         data = dl_data
@@ -2922,7 +2833,7 @@ class DiscordVoiceBot:
                                 try:
                                     ytdl_auth = yt_dlp.YoutubeDL(auth_dl_opts)
                                     dl_data = await loop.run_in_executor(
-                                        None, lambda: ytdl_auth.extract_info(dl_target, download=False)
+                                        None, lambda: ytdl_auth.extract_info(dl_target, download=True)
                                     )
                                     if dl_data:
                                         data = dl_data
@@ -2936,41 +2847,24 @@ class DiscordVoiceBot:
                             else:
                                 logger.info(f"Search candidate {cand_id or dl_target} unavailable ({dl_err}), trying next candidate...")
 
-                    stream_url = None
-                    if data:
-                        if "entries" in data:
-                            entries = [e for e in data["entries"] if e]
-                            if not entries:
-                                return False, f"Track unavailable ({last_error or 'no playable stream'})", False, {}
-                            data = entries[0]
-
-                        stream_url = data.get("url")
-                        if not stream_url and "formats" in data:
-                            audio_formats = [
-                                f for f in data["formats"]
-                                if f.get("url") and (f.get("vcodec") == "none" or "audio" in f.get("format", "").lower() or f.get("acodec") != "none")
-                            ]
-                            if audio_formats:
-                                stream_url = audio_formats[-1].get("url")
-                                if "http_headers" in audio_formats[-1]:
-                                    http_headers = audio_formats[-1].get("http_headers")
+                    if data and "entries" in data:
+                        entries = [e for e in data["entries"] if e]
+                        if not entries:
+                            return False, f"Track unavailable ({last_error or 'no playable stream'})", False, {}
+                        data = entries[0]
 
                     if not data:
                         return False, f"Track unavailable ({last_error or 'not found'})", False, {}
 
-                    if stream_url:
-                        direct_url = stream_url
-                        filepath = None
-                    else:
-                        prep_ydl = ytdl_active or yt_dlp.YoutubeDL(dl_opts)
-                        filepath = prep_ydl.prepare_filename(data)
-                        if not os.path.exists(filepath):
-                            target_id = data.get("id", "") or res_vid
-                            for fname in os.listdir(cache_dir):
-                                if target_id and fname.startswith(target_id):
-                                    filepath = os.path.join(cache_dir, fname)
-                                    break
-                        direct_url = filepath
+                    prep_ydl = ytdl_active or yt_dlp.YoutubeDL(dl_opts)
+                    filepath = prep_ydl.prepare_filename(data)
+                    if not os.path.exists(filepath):
+                        target_id = data.get("id", "") or res_vid
+                        for fname in os.listdir(cache_dir):
+                            if target_id and fname.startswith(target_id):
+                                filepath = os.path.join(cache_dir, fname)
+                                break
+                    direct_url = filepath
 
             if not data:
                 return False, "Track not found.", False, {}
@@ -3018,7 +2912,7 @@ class DiscordVoiceBot:
                 "emoji": emoji,
             }
 
-            # Save metadata and enforce storage limits asynchronously if audio file exists
+            # Save metadata and enforce storage limits asynchronously to eliminate event loop lag
             if target_vid and filepath and os.path.exists(filepath):
                 meta_dict = {
                     "title": title,
@@ -3033,39 +2927,6 @@ class DiscordVoiceBot:
                     prune_audio_cache(cache_dir)
 
                 loop.run_in_executor(None, _bg_persist)
-
-            # If playing via direct stream, trigger background caching so subsequent plays are instant from cache
-            if target_vid and not filepath and direct_url:
-                bg_dl_opts = dict(dl_opts if "dl_opts" in locals() else YTDL_OPTIONS)
-                bg_meta = {
-                    "title": title,
-                    "uploader": uploader,
-                    "duration_sec": sec,
-                    "duration_str": dur_str,
-                    "webpage_url": final_web_url or f"https://www.youtube.com/watch?v={target_vid}",
-                    "video_id": target_vid,
-                }
-                bg_target = final_web_url or f"https://www.youtube.com/watch?v={target_vid}"
-                def _bg_download_to_cache():
-                    try:
-                        save_opts = dict(bg_dl_opts)
-                        save_opts["outtmpl"] = os.path.join(cache_dir, "%(id)s.%(ext)s")
-                        save_opts["noplaylist"] = True
-                        save_opts.pop("extract_flat", None)
-                        if os.path.exists(COOKIE_PATH):
-                            save_opts["cookiefile"] = COOKIE_PATH
-                        else:
-                            save_opts.pop("cookiefile", None)
-                        ydl_bg = yt_dlp.YoutubeDL(save_opts)
-                        bg_info = ydl_bg.extract_info(bg_target, download=True)
-                        if bg_info:
-                            save_track_cache_meta(cache_dir, target_vid, bg_meta)
-                            prune_audio_cache(cache_dir)
-                            logger.info(f"Background cache completed for: '{title}' ({target_vid})")
-                    except Exception as bg_err:
-                        logger.debug(f"Background caching notice for {target_vid}: {bg_err}")
-
-                loop.run_in_executor(None, _bg_download_to_cache)
 
             # Check if playback is currently active
             if self.is_playing or self.is_paused:
