@@ -61,8 +61,8 @@ def print_help():
     print("  q, queue              - Show upcoming track queue")
     print("  pause                 - Pause playback")
     print("  resume                - Resume playback")
-    print("  stop                  - Stop playback and clear queue")
-    print("  a, autoplay [on/off]  - Toggle or set autoplay (plays random cache songs)")
+    print("  a, autoplay [mode]    - Autoplay controls: smart, standard, off, reset, status")
+    print("  smartautoplay [mode]  - Shortcut for Smart Autoplay (no repeats today)")
     print("  v, vol <0-150>        - Set playback volume percentage")
     print("  logs [n]              - Show recent bot operational logs (default: 20)")
     print("  help                  - Show this help list")
@@ -263,18 +263,42 @@ def main():
                         print(f"  {i}. {t['title']} [{t['duration_str']}] ({t['requester']})")
                     print("-----------------------------")
 
-            elif cmd in ("a", "autoplay"):
+            elif cmd in ("a", "autoplay", "smartautoplay"):
                 if not arg:
-                    status = "ON" if bot.autoplay else "OFF"
+                    st = bot.get_autoplay_status()
+                    status = "ON" if st["enabled"] else "OFF"
+                    mode_str = "Smart (no repeats today)" if st["smart"] else "Standard (random repeats)"
                     print(f"Autoplay is currently: {status}")
+                    print(f"Mode: {mode_str}")
+                    print(f"Songs played today by autoplay: {st['played_today_count']}")
+                    print(f"Total cached tracks: {st['total_cached_count']}")
+                    print(f"Remaining unplayed today: {st['remaining_unplayed']}")
+                elif arg.lower() in ("smart", "smart-on"):
+                    bot.set_autoplay(True, smart=True)
+                    print("Smart Autoplay enabled (unplayed cached songs today, no repeats).")
                 elif arg.lower() in ("on", "1", "true", "enable"):
-                    bot.set_autoplay(True)
-                    print("Autoplay enabled (will play random cached songs when queue ends).")
+                    bot.set_autoplay(True, smart=True)
+                    print("Autoplay enabled in Smart Mode (unplayed cached songs today, no repeats).")
+                elif arg.lower() in ("standard", "normal", "rand", "random"):
+                    bot.set_autoplay(True, smart=False)
+                    print("Standard Autoplay enabled (random songs from cache, repeats allowed).")
+                elif arg.lower() in ("reset", "clear"):
+                    bot.clear_autoplay_history()
+                    print("Autoplay daily history reset. All cached songs can play again today.")
                 elif arg.lower() in ("off", "0", "false", "disable"):
                     bot.set_autoplay(False)
                     print("Autoplay disabled.")
+                elif arg.lower() in ("status", "info"):
+                    st = bot.get_autoplay_status()
+                    status = "ON" if st["enabled"] else "OFF"
+                    mode_str = "Smart (no repeats today)" if st["smart"] else "Standard (random repeats)"
+                    print(f"Autoplay Status: {status}")
+                    print(f"Mode: {mode_str}")
+                    print(f"Songs played today: {st['played_today_count']}")
+                    print(f"Total cached tracks: {st['total_cached_count']}")
+                    print(f"Remaining unplayed today: {st['remaining_unplayed']}")
                 else:
-                    print("Usage: autoplay [on/off]")
+                    print("Usage: autoplay [smart/standard/off/reset/status]")
 
             elif cmd in ("v", "vol", "volume"):
                 if not arg:

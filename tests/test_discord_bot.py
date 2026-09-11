@@ -1330,6 +1330,231 @@ class TestDiscordVoiceBot(unittest.TestCase):
             self.assertEqual(track.get("video_id"), "live_vid_2")
             self.assertEqual(track.get("title"), "Live Song 2")
 
+    def test_smart_autoplay_excludes_tracks_played_today(self):
+        """Verify Smart Autoplay does not replay tracks that were already played today."""
+        import tempfile
+        from engine.discord_bot import AudioCacheIndex
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            index = AudioCacheIndex()
+            file_a = os.path.join(tmpdir, "SONG_A.opus")
+            file_b = os.path.join(tmpdir, "SONG_B.opus")
+            file_c = os.path.join(tmpdir, "SONG_C.opus")
+            for f in (file_a, file_b, file_c):
+                with open(f, "wb") as fp:
+                    fp.write(b"0" * 2048)
+
+            index.put(tmpdir, "SONG_A", {"title": "Song A", "video_id": "SONG_A"}, file_a)
+            index.put(tmpdir, "SONG_B", {"title": "Song B", "video_id": "SONG_B"}, file_b)
+            index.put(tmpdir, "SONG_C", {"title": "Song C", "video_id": "SONG_C"}, file_c)
+
+            # Initially none played today, all 3 available
+            res = index.get_random_track(tmpdir, exclude_vid_ids=set())
+            self.assertIsNotNone(res)
+
+            # If SONG_A and SONG_B were played today, only SONG_C can be chosen
+            played_today = {"SONG_A", "SONG_B"}
+            res_c = index.get_random_track(tmpdir, exclude_vid_ids=played_today)
+            self.assertIsNotNone(res_c)
+            self.assertEqual(res_c[1]["video_id"], "SONG_C")
+
+            # Once all songs are played today, get_random_track returns None (no repeat today!)
+            played_all = {"SONG_A", "SONG_B", "SONG_C"}
+            res_none = index.get_random_track(tmpdir, exclude_vid_ids=played_all)
+            self.assertIsNone(res_none, "Smart autoplay must not repeat any song once all songs played today")
+
+    def test_smart_autoplay_date_rollover_and_persistence(self):
+        """Verify Smart Autoplay state rolls over when date changes and persists to disk."""
+        import tempfile
+        from engine.discord_bot import (
+            DiscordVoiceBot,
+            get_today_date_str,
+            load_autoplay_history,
+            save_autoplay_history,
+        )
+
+        bot = DiscordVoiceBot()
+        bot.clear_autoplay_history()
+
+        # 1. Record track
+        bot.record_autoplay_track("DAILY_SONG_1")
+        played = bot._get_autoplay_played_ids_today()
+        self.assertIn("DAILY_SONG_1", played)
+
+        # 2. Date rollover: simulate that the stored date was yesterday
+        yesterday_str = "2020-01-01"
+        bot._autoplay_date = yesterday_str
+        bot._autoplay_played_ids = {"YESTERDAY_SONG"}
+
+        # _get_autoplay_played_ids_today should detect new day and reset
+        today_played = bot._get_autoplay_played_ids_today()
+        self.assertEqual(today_played, set(), "Autoplay history must automatically reset on new calendar day")
+        self.assertEqual(bot._autoplay_date, get_today_date_str())
+
+        bot.clear_autoplay_history()
+
+    def test_smart_autoplay_user_controls_and_slash_commands(self):
+        """Verify user controls for Smart Autoplay (mode toggle, reset, status, UI dropdown, and /smartautoplay)."""
+        import discord
+        from discord.ext import commands
+        from engine.discord_bot import DiscordVoiceBot
+        from unittest.mock import AsyncMock
+
+        bot = DiscordVoiceBot()
+        bot.clear_autoplay_history()
+
+        # 1. Test set_autoplay with smart parameter and set_smart_autoplay
+        bot.set_autoplay(True, smart=True)
+        self.assertTrue(bot.autoplay)
+        self.assertTrue(bot.smart_autoplay)
+
+        bot.set_autoplay(True, smart=False)
+        self.assertTrue(bot.autoplay)
+        self.assertFalse(bot.smart_autoplay)
+
+        bot.set_smart_autoplay(True)
+        self.assertTrue(bot.smart_autoplay)
+
+        # 2. Test get_autoplay_status
+        status = bot.get_autoplay_status()
+        self.assertTrue(status["enabled"])
+        self.assertTrue(status["smart"])
+        self.assertIn("played_today_count", status)
+        self.assertIn("total_cached_count", status)
+        self.assertIn("remaining_unplayed", status)
+
+        # 3. Test slash commands registration
+        intents = discord.Intents.default()
+        bot.client = commands.Bot(command_prefix="!", intents=intents)
+        bot._register_slash_commands()
+
+        tree_cmds = {c.name: c for c in bot.client.tree.get_commands()}
+        self.assertIn("autoplay", tree_cmds)
+        self.assertIn("smartautoplay", tree_cmds)
+
+        cmd_autoplay = tree_cmds["autoplay"]
+        cmd_smartautoplay = tree_cmds["smartautoplay"]
+
+        # 4. Verify autoplay command mode options
+        param_mode = cmd_autoplay.parameters[0]
+        choice_vals = [c.value for c in param_mode.choices]
+        self.assertIn("smart", choice_vals)
+        self.assertIn("standard", choice_vals)
+        self.assertIn("reset", choice_vals)
+        self.assertIn("status", choice_vals)
+
+        mock_interaction = MagicMock()
+        mock_interaction.guild = None
+        mock_interaction.response.defer = AsyncMock()
+        mock_interaction.followup.send = AsyncMock()
+
+        # 5. Test /autoplay mode="smart"
+        asyncio.run(cmd_autoplay.callback(mock_interaction, mode="smart"))
+        self.assertTrue(bot.autoplay)
+        self.assertTrue(bot.smart_autoplay)
+        sent_smart = mock_interaction.followup.send.call_args[0][0]
+        self.assertIn("Smart Mode", sent_smart)
+
+        # 6. Test /autoplay mode="standard"
+        mock_interaction.followup.send.reset_mock()
+        asyncio.run(cmd_autoplay.callback(mock_interaction, mode="standard"))
+        self.assertTrue(bot.autoplay)
+        self.assertFalse(bot.smart_autoplay)
+        sent_std = mock_interaction.followup.send.call_args[0][0]
+        self.assertIn("Standard Mode", sent_std)
+
+        # 7. Test /autoplay mode="reset"
+        bot.record_autoplay_track("TEST_RESET_VID")
+        self.assertIn("TEST_RESET_VID", bot._get_autoplay_played_ids_today())
+        mock_interaction.followup.send.reset_mock()
+        asyncio.run(cmd_autoplay.callback(mock_interaction, mode="reset"))
+        self.assertEqual(len(bot._get_autoplay_played_ids_today()), 0)
+        sent_reset = mock_interaction.followup.send.call_args[0][0]
+        self.assertIn("reset", sent_reset.lower())
+
+        # 8. Test /autoplay mode="status"
+        mock_interaction.followup.send.reset_mock()
+        asyncio.run(cmd_autoplay.callback(mock_interaction, mode="status"))
+        sent_stat = mock_interaction.followup.send.call_args[0][0]
+        self.assertIn("Autoplay Status", sent_stat)
+
+        # 9. Test /smartautoplay command
+        mock_interaction.followup.send.reset_mock()
+        asyncio.run(cmd_smartautoplay.callback(mock_interaction, action="off"))
+        self.assertFalse(bot.autoplay)
+
+        mock_interaction.followup.send.reset_mock()
+        asyncio.run(cmd_smartautoplay.callback(mock_interaction, action="on"))
+        self.assertTrue(bot.autoplay)
+        self.assertTrue(bot.smart_autoplay)
+
+        mock_interaction.followup.send.reset_mock()
+        asyncio.run(cmd_smartautoplay.callback(mock_interaction, action="status"))
+        sent_smart_stat = mock_interaction.followup.send.call_args[0][0]
+        self.assertIn("Smart Autoplay Status", sent_smart_stat)
+
+        # 10. Test AutoplaySelect interactive dropdown callbacks
+        # Find AutoplaySelect inside the closure by executing mode=None
+        mock_interaction.followup.send.reset_mock()
+        asyncio.run(cmd_autoplay.callback(mock_interaction, mode=None))
+        view = mock_interaction.followup.send.call_args[1].get("view")
+        select_item = view.children[0]
+        select_values = [opt.value for opt in select_item.options]
+        self.assertIn("smart", select_values)
+        self.assertIn("standard", select_values)
+        self.assertIn("reset", select_values)
+        self.assertIn("off", select_values)
+
+        # Test selecting 'standard' via UI callback
+        mock_select_interaction = MagicMock()
+        mock_select_interaction.guild = None
+        mock_select_interaction.response.defer = AsyncMock()
+        mock_select_interaction.edit_original_response = AsyncMock()
+        select_item._values = ["standard"]
+        asyncio.run(select_item.callback(mock_select_interaction))
+        self.assertTrue(bot.autoplay)
+        self.assertFalse(bot.smart_autoplay)
+
+        # Test selecting 'smart' via UI callback
+        select_item._values = ["smart"]
+        asyncio.run(select_item.callback(mock_select_interaction))
+        self.assertTrue(bot.autoplay)
+        self.assertTrue(bot.smart_autoplay)
+
+        bot.clear_autoplay_history()
+
+    def test_autoplay_standard_mode_allows_repeats(self):
+        """Verify that when standard autoplay is enabled, songs can repeat even if marked in history."""
+        from engine.discord_bot import DiscordVoiceBot
+
+        bot = DiscordVoiceBot()
+        bot.set_autoplay(True, smart=False)
+        self.assertFalse(bot.smart_autoplay)
+
+        bot.voice_client = MagicMock()
+        bot.voice_client.is_connected.return_value = True
+        bot.queue = []
+
+        fake_cached = (
+            "cache/repeatable_vid.webm",
+            {
+                "title": "Repeatable Song",
+                "webpage_url": "https://www.youtube.com/watch?v=repeatable_vid",
+                "video_id": "repeatable_vid",
+            },
+        )
+
+        with patch("engine.discord_bot.AUDIO_CACHE_INDEX.get_random_track", return_value=fake_cached) as mock_rand:
+            track = bot.get_next_track()
+            self.assertIsNotNone(track)
+            self.assertEqual(track["title"], "Repeatable Song")
+            # In standard mode (smart_autoplay=False), exclude_vid_ids must be None
+            mock_rand.assert_called_once()
+            _, kwargs = mock_rand.call_args
+            self.assertIsNone(kwargs.get("exclude_vid_ids"), "Standard mode must not pass exclude_vid_ids")
+            # In standard mode, track must not be recorded into daily smart history
+            self.assertNotIn("repeatable_vid", bot._get_autoplay_played_ids_today())
+
 
 if __name__ == "__main__":
     unittest.main()

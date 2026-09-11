@@ -18,7 +18,8 @@ import time
 import urllib.parse
 import urllib.request
 import warnings
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from datetime import datetime
+from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
 import discord
@@ -394,6 +395,7 @@ ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env")
 CONFIG_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".bot_config.json"))
 AUDIO_CACHE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cache"))
 USER_HISTORY_PATH = os.path.join(AUDIO_CACHE_DIR, "user_history.json")
+AUTOPLAY_HISTORY_PATH = os.path.join(AUDIO_CACHE_DIR, "autoplay_history.json")
 DEFAULT_MAX_CACHE_MB = 500
 DEFAULT_MAX_CACHE_FILES = 50
 
@@ -546,7 +548,7 @@ class AudioCacheIndex:
         except OSError:
             return
 
-        json_files = {f[:-5]: f for f in files if f.endswith(".json") and f != "user_history.json"}
+        json_files = {f[:-5]: f for f in files if f.endswith(".json") and f not in ("user_history.json", "autoplay_history.json")}
         audio_files = {}
         for f in files:
             for ext in audio_exts:
@@ -755,9 +757,17 @@ class AudioCacheIndex:
         return None, None
 
     def get_random_track(
-        self, cache_dir: str, exclude_vid_id: Optional[str] = None
+        self,
+        cache_dir: str,
+        exclude_vid_id: Optional[str] = None,
+        exclude_vid_ids: Optional[Union[Set[str], List[str], Tuple[str, ...]]] = None,
     ) -> Optional[Tuple[str, Dict[str, any]]]:
-        """Return a random cached track (filepath, meta), optionally excluding exclude_vid_id. Returns None if no cached tracks exist."""
+        """
+        Return a random cached track (filepath, meta).
+        exclude_vid_id: immediately preceding video ID to avoid back-to-back repeats.
+        exclude_vid_ids: set of video IDs already played today (Smart Autoplay).
+        Returns None if no cached tracks exist or all available tracks have already been played today.
+        """
         if not os.path.exists(cache_dir):
             return None
 
@@ -803,8 +813,21 @@ class AudioCacheIndex:
             if not valid_candidates:
                 return None
 
-            filtered = [c for c in valid_candidates if c[0] != exclude_vid_id]
-            pool = filtered if filtered else valid_candidates
+            to_exclude_today = set(exclude_vid_ids) if exclude_vid_ids else set()
+
+            # Filter out tracks already played today by autoplay
+            unplayed_today = [c for c in valid_candidates if c[0] not in to_exclude_today]
+            if not unplayed_today:
+                return None
+
+            # Avoid immediate repeat if other unplayed tracks exist
+            if exclude_vid_id:
+                pool = [c for c in unplayed_today if c[0] != exclude_vid_id]
+                if not pool:
+                    pool = unplayed_today
+            else:
+                pool = unplayed_today
+
             chosen = random.choice(pool)
             chosen_vid, chosen_fp, chosen_meta = chosen
             title = chosen_meta.get("title", "").strip()
@@ -1119,6 +1142,46 @@ def save_user_history(history: Dict[str, List[Dict[str, any]]]):
             logger.warning(f"Failed to save user history: {e}")
 
 
+_AUTOPLAY_HISTORY_FILE_LOCK = threading.Lock()
+
+
+def get_today_date_str() -> str:
+    """Return current date formatted as YYYY-MM-DD."""
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def load_autoplay_history() -> Dict[str, any]:
+    """
+    Load persistent daily autoplay history from cache/autoplay_history.json.
+    Automatically resets when date changes to a new calendar day.
+    """
+    today = get_today_date_str()
+    if os.path.exists(AUTOPLAY_HISTORY_PATH):
+        try:
+            with open(AUTOPLAY_HISTORY_PATH, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    data = json.loads(content)
+                    if isinstance(data, dict):
+                        if data.get("date") == today and isinstance(data.get("played_ids"), list):
+                            return data
+        except Exception as e:
+            logger.warning(f"Failed to load autoplay history: {e}")
+    return {"date": today, "played_ids": []}
+
+
+def save_autoplay_history(history: Dict[str, any]):
+    """Save persistent daily autoplay history to cache/autoplay_history.json."""
+    with _AUTOPLAY_HISTORY_FILE_LOCK:
+        try:
+            cache_dir = os.path.dirname(AUTOPLAY_HISTORY_PATH)
+            os.makedirs(cache_dir, exist_ok=True)
+            with open(AUTOPLAY_HISTORY_PATH, "w", encoding="utf-8") as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to save autoplay history: {e}")
+
+
 def load_saved_token() -> str:
     """
     Load Discord Bot Token with the following priority:
@@ -1352,8 +1415,13 @@ class DiscordVoiceBot:
         self._idle_since: Optional[float] = None
         self._auto_leave_task: Optional[asyncio.Task] = None
 
-        # Autoplay setting (play random cached track when queue is empty)
+        # Smart Autoplay setting (plays unplayed random cached tracks today when queue is empty)
         self.autoplay: bool = os.environ.get("AUTOPLAY_ENABLED", "false").lower() in ("true", "1", "yes")
+        self.smart_autoplay: bool = os.environ.get("SMART_AUTOPLAY_ENABLED", "true").lower() in ("true", "1", "yes")
+        self._autoplay_lock = threading.Lock()
+        auto_data = load_autoplay_history()
+        self._autoplay_date: str = auto_data.get("date", get_today_date_str())
+        self._autoplay_played_ids: Set[str] = set(auto_data.get("played_ids", []))
         self._manual_stop: bool = False
         self._manual_skip: bool = False
         self.last_text_channel: Optional[discord.abc.Messageable] = None
@@ -1440,6 +1508,41 @@ class DiscordVoiceBot:
 
         threading.Thread(target=save_user_history, args=(hist_copy,), daemon=True).start()
         return count
+
+    def _get_autoplay_played_ids_today(self) -> Set[str]:
+        """Return set of track IDs already played today by smart autoplay, auto-rolling over at midnight."""
+        today = get_today_date_str()
+        with self._autoplay_lock:
+            if self._autoplay_date != today:
+                self._autoplay_date = today
+                self._autoplay_played_ids.clear()
+                save_autoplay_history({"date": today, "played_ids": []})
+            return set(self._autoplay_played_ids)
+
+    def record_autoplay_track(self, vid_id: Optional[str]):
+        """Record track ID as played today by smart autoplay."""
+        if not vid_id:
+            return
+        today = get_today_date_str()
+        with self._autoplay_lock:
+            if self._autoplay_date != today:
+                self._autoplay_date = today
+                self._autoplay_played_ids.clear()
+            self._autoplay_played_ids.add(vid_id)
+            data_to_save = {
+                "date": self._autoplay_date,
+                "played_ids": list(self._autoplay_played_ids),
+            }
+        threading.Thread(target=save_autoplay_history, args=(data_to_save,), daemon=True).start()
+
+    def clear_autoplay_history(self):
+        """Reset smart autoplay history for today."""
+        today = get_today_date_str()
+        with self._autoplay_lock:
+            self._autoplay_date = today
+            self._autoplay_played_ids.clear()
+            data_to_save = {"date": today, "played_ids": []}
+        save_autoplay_history(data_to_save)
 
     async def _get_http_session(self) -> aiohttp.ClientSession:
         """Get or lazily create a persistent aiohttp.ClientSession for the bot loop."""
@@ -1802,7 +1905,14 @@ class DiscordVoiceBot:
 
                 msg = f"{track_prefix}Skipped {old_link}.\nNow playing {next_link}{next_up}{next_dur_part}."
             elif self.autoplay:
-                msg = f"{prefix}Skipped {old_link}. Autoplay is active, but no cached tracks were found in cache/."
+                if self.smart_autoplay:
+                    played_today = self._get_autoplay_played_ids_today()
+                    if played_today:
+                        msg = f"{prefix}Skipped {old_link}. Smart Autoplay is active, but all cached songs have already been played today."
+                    else:
+                        msg = f"{prefix}Skipped {old_link}. Autoplay is active, but no cached tracks were found in cache/."
+                else:
+                    msg = f"{prefix}Skipped {old_link}. Autoplay is active, but no cached tracks were found in cache/."
             else:
                 msg = f"{prefix}Skipped {old_link}. The queue is now empty."
 
@@ -1918,14 +2028,21 @@ class DiscordVoiceBot:
                 await interaction.response.send_message("Bot is not in a voice channel.", ephemeral=True)
 
         class AutoplaySelect(discord.ui.Select):
-            def __init__(ui_self, current_autoplay: bool):
+            def __init__(ui_self, current_autoplay: bool, current_smart: bool = True):
                 options = [
                     discord.SelectOption(
-                        label="Autoplay ON",
-                        value="on",
-                        description="Plays random cached songs when queue ends",
-                        emoji="▶️",
-                        default=current_autoplay,
+                        label="Smart Autoplay (No repeats today)",
+                        value="smart",
+                        description="Plays unplayed songs today, no repeats until midnight",
+                        emoji="🧠",
+                        default=(current_autoplay and current_smart),
+                    ),
+                    discord.SelectOption(
+                        label="Standard Autoplay (Random)",
+                        value="standard",
+                        description="Plays random cached songs without daily restriction",
+                        emoji="🔀",
+                        default=(current_autoplay and not current_smart),
                     ),
                     discord.SelectOption(
                         label="Autoplay OFF",
@@ -1934,33 +2051,46 @@ class DiscordVoiceBot:
                         emoji="⏹️",
                         default=not current_autoplay,
                     ),
+                    discord.SelectOption(
+                        label="Reset Daily History",
+                        value="reset",
+                        description="Clear today's played tracks history so songs can replay",
+                        emoji="🔄",
+                    ),
                 ]
                 super().__init__(placeholder="Choose autoplay mode...", min_values=1, max_values=1, options=options)
 
             async def callback(ui_self, select_interaction: discord.Interaction):
                 await select_interaction.response.defer()
                 chosen_val = ui_self.values[0]
-                if chosen_val == "on":
-                    res_msg = await bot_enable_autoplay(select_interaction)
+                emoji = get_random_server_emoji(select_interaction.guild)
+                prefix = f"{emoji} " if emoji else ""
+
+                if chosen_val == "smart":
+                    res_msg = await bot_enable_autoplay(select_interaction, smart=True)
+                elif chosen_val == "standard":
+                    res_msg = await bot_enable_autoplay(select_interaction, smart=False)
+                elif chosen_val == "reset":
+                    self.clear_autoplay_history()
+                    res_msg = f"{prefix}Autoplay daily history has been **reset**! All cached songs are now eligible to play again."
                 else:
                     self.set_autoplay(False)
-                    emoji = get_random_server_emoji(select_interaction.guild)
-                    prefix = f"{emoji} " if emoji else ""
                     res_msg = f"{prefix}Autoplay is now **OFF**. Playback will stop when the queue is empty."
 
-                new_view = AutoplaySelectView(self.autoplay)
+                new_view = AutoplaySelectView(self.autoplay, self.smart_autoplay)
                 await select_interaction.edit_original_response(content=res_msg, view=new_view)
 
         class AutoplaySelectView(discord.ui.View):
-            def __init__(ui_self, current_autoplay: bool):
+            def __init__(ui_self, current_autoplay: bool, current_smart: bool = True):
                 super().__init__(timeout=180)
-                ui_self.add_item(AutoplaySelect(current_autoplay))
+                ui_self.add_item(AutoplaySelect(current_autoplay, current_smart))
 
-        async def bot_enable_autoplay(interaction: discord.Interaction) -> str:
-            self.set_autoplay(True, trigger=False)
+        async def bot_enable_autoplay(interaction: discord.Interaction, smart: bool = True) -> str:
+            self.set_autoplay(True, smart=smart, trigger=False)
             emoji = get_random_server_emoji(interaction.guild)
             prefix = f"{emoji} " if emoji else ""
 
+            mode_label = "Smart Mode (no repeats today)" if self.smart_autoplay else "Standard Mode (random)"
             is_active = (self.voice_client and (self.voice_client.is_playing() or self.voice_client.is_paused())) or self.is_playing
 
             if is_active and self.current_track:
@@ -1968,7 +2098,10 @@ class DiscordVoiceBot:
                 self.current_title = cur_title
                 cur_url = self.current_track.get("webpage_url", "")
                 cur_link = format_song_link(cur_title, cur_url)
-                return f"{prefix}Autoplay is now **ON**.\nCurrently playing {cur_link}. When the queue ends, random songs from cache will play automatically."
+                if self.smart_autoplay:
+                    return f"{prefix}Autoplay is now **ON** ({mode_label}).\nCurrently playing {cur_link}. When the queue ends, unplayed songs from cache will play automatically."
+                else:
+                    return f"{prefix}Autoplay is now **ON** ({mode_label}).\nCurrently playing {cur_link}. When the queue ends, random songs from cache will play automatically."
 
             # If not currently playing but bot is connected in a voice channel with empty queue:
             if self.voice_client and self.voice_client.is_connected() and not self.queue:
@@ -1977,48 +2110,141 @@ class DiscordVoiceBot:
                     t_title = ensure_track_title(started_track)
                     t_url = started_track.get("webpage_url", "")
                     t_link = format_song_link(t_title, t_url)
-                    return f"{prefix}Autoplay is now **ON**.\nNow playing {t_link} from cache!"
+                    return f"{prefix}Autoplay is now **ON** ({mode_label}).\nNow playing {t_link} from cache!"
+                else:
+                    if self.smart_autoplay:
+                        played_today = self._get_autoplay_played_ids_today()
+                        if played_today:
+                            return f"{prefix}Autoplay is now **ON** ({mode_label}), but all cached songs have already been played today. Use `/autoplay reset` to clear history."
+                    return f"{prefix}Autoplay is now **ON** ({mode_label}).\nWhen the queue ends, songs from cache will play automatically."
 
-            return f"{prefix}Autoplay is now **ON**.\nWhen the queue ends, random songs from cache will play automatically."
+            return f"{prefix}Autoplay is now **ON** ({mode_label}).\nWhen the queue ends, songs from cache will play automatically."
 
         @bot.tree.command(
             name="autoplay",
-            description="Control autoplay mode (plays random songs from cache when queue ends)",
+            description="Control autoplay mode (smart unplayed songs, standard random, off, or reset)",
         )
-        @app_commands.describe(mode="Choose whether autoplay is on or off")
+        @app_commands.describe(mode="Autoplay mode (smart, standard, on, off, reset, or status)")
         @app_commands.choices(
             mode=[
-                app_commands.Choice(name="on", value="on"),
+                app_commands.Choice(name="smart (no repeats today)", value="smart"),
+                app_commands.Choice(name="standard (repeats allowed)", value="standard"),
+                app_commands.Choice(name="on (smart autoplay)", value="on"),
                 app_commands.Choice(name="off", value="off"),
+                app_commands.Choice(name="reset (clear today's history)", value="reset"),
+                app_commands.Choice(name="status", value="status"),
             ]
         )
         async def cmd_autoplay(interaction: discord.Interaction, mode: Optional[str] = None):
             await interaction.response.defer(ephemeral=False)
             try:
-                if mode == "on":
-                    msg = await bot_enable_autoplay(interaction)
+                emoji = get_random_server_emoji(interaction.guild)
+                prefix = f"{emoji} " if emoji else ""
+                if mode in ("smart", "on"):
+                    msg = await bot_enable_autoplay(interaction, smart=True)
+                    await interaction.followup.send(msg, suppress_embeds=True)
+                elif mode == "standard":
+                    msg = await bot_enable_autoplay(interaction, smart=False)
                     await interaction.followup.send(msg, suppress_embeds=True)
                 elif mode == "off":
                     self.set_autoplay(False)
-                    emoji = get_random_server_emoji(interaction.guild)
-                    prefix = f"{emoji} " if emoji else ""
                     msg = f"{prefix}Autoplay is now **OFF**. Playback will stop when the queue is empty."
+                    await interaction.followup.send(msg)
+                elif mode == "reset":
+                    self.clear_autoplay_history()
+                    msg = f"{prefix}Autoplay daily history has been **reset**! All cached songs are now eligible to play again."
+                    await interaction.followup.send(msg)
+                elif mode == "status":
+                    status_info = self.get_autoplay_status()
+                    curr_state = "ON" if status_info["enabled"] else "OFF"
+                    mode_info = "Smart Mode (no repeats today)" if status_info["smart"] else "Standard Mode (random)"
+                    played_cnt = status_info["played_today_count"]
+                    total_cnt = status_info["total_cached_count"]
+                    rem_cnt = status_info["remaining_unplayed"]
+                    msg = (
+                        f"{prefix}**Autoplay Status**\n"
+                        f"• State: **{curr_state}**\n"
+                        f"• Mode: **{mode_info}**\n"
+                        f"• Played today: **{played_cnt}** track(s)\n"
+                        f"• Total in cache: **{total_cnt}** track(s)\n"
+                        f"• Remaining unplayed today: **{rem_cnt}** track(s)"
+                    )
                     await interaction.followup.send(msg)
                 else:
                     current_state = "ON" if self.autoplay else "OFF"
-                    emoji = get_random_server_emoji(interaction.guild)
-                    prefix = f"{emoji} " if emoji else ""
+                    mode_desc = "Smart Mode (no repeats today)" if self.smart_autoplay else "Standard Mode"
+                    played_cnt = len(self._get_autoplay_played_ids_today())
                     msg = (
-                        f"{prefix}Autoplay is currently **{current_state}**.\n"
+                        f"{prefix}Autoplay is currently **{current_state}** ({mode_desc}).\n"
+                        f"Songs played today: **{played_cnt}**\n"
                         "Choose an option below to change autoplay mode:"
                     )
-                    view = AutoplaySelectView(self.autoplay)
+                    view = AutoplaySelectView(self.autoplay, self.smart_autoplay)
                     await interaction.followup.send(msg, view=view)
             except Exception as e:
                 logger.error(f"Error in cmd_autoplay: {e}")
                 try:
                     await interaction.followup.send(
                         "An error occurred while changing autoplay settings. Please try again.",
+                        ephemeral=True,
+                    )
+                except Exception:
+                    pass
+
+        @bot.tree.command(
+            name="smartautoplay",
+            description="Manage Smart Autoplay (plays unplayed songs today, no repeats)",
+        )
+        @app_commands.describe(action="Action to perform (enable, disable, reset daily history, or status)")
+        @app_commands.choices(
+            action=[
+                app_commands.Choice(name="on (enable smart autoplay)", value="on"),
+                app_commands.Choice(name="off (disable autoplay)", value="off"),
+                app_commands.Choice(name="reset (clear today's history)", value="reset"),
+                app_commands.Choice(name="status (view today's progress)", value="status"),
+            ]
+        )
+        async def cmd_smartautoplay(interaction: discord.Interaction, action: Optional[str] = None):
+            await interaction.response.defer(ephemeral=False)
+            try:
+                act = (action or "on").lower()
+                emoji = get_random_server_emoji(interaction.guild)
+                prefix = f"{emoji} " if emoji else ""
+                if act in ("on", "enable"):
+                    msg = await bot_enable_autoplay(interaction, smart=True)
+                    await interaction.followup.send(msg, suppress_embeds=True)
+                elif act in ("off", "disable"):
+                    self.set_autoplay(False)
+                    msg = f"{prefix}Smart Autoplay is now **OFF**. Playback will stop when the queue is empty."
+                    await interaction.followup.send(msg)
+                elif act in ("reset", "clear"):
+                    self.clear_autoplay_history()
+                    msg = f"{prefix}Smart Autoplay daily history has been **reset**! All cached songs can play again today."
+                    await interaction.followup.send(msg)
+                elif act in ("status", "info"):
+                    status_info = self.get_autoplay_status()
+                    curr_state = "ON" if status_info["enabled"] else "OFF"
+                    played_cnt = status_info["played_today_count"]
+                    total_cnt = status_info["total_cached_count"]
+                    rem_cnt = status_info["remaining_unplayed"]
+                    mode_info = "Smart (no repeats today)" if status_info["smart"] else "Standard (random repeats)"
+                    msg = (
+                        f"{prefix}**Smart Autoplay Status**\n"
+                        f"• State: **{curr_state}**\n"
+                        f"• Mode: **{mode_info}**\n"
+                        f"• Songs played today: **{played_cnt}**\n"
+                        f"• Total cache library: **{total_cnt}**\n"
+                        f"• Remaining unplayed today: **{rem_cnt}**"
+                    )
+                    await interaction.followup.send(msg)
+                else:
+                    msg = await bot_enable_autoplay(interaction, smart=True)
+                    await interaction.followup.send(msg, suppress_embeds=True)
+            except Exception as e:
+                logger.error(f"Error in cmd_smartautoplay: {e}")
+                try:
+                    await interaction.followup.send(
+                        "An error occurred while managing smart autoplay. Please try again.",
                         ephemeral=True,
                     )
                 except Exception:
@@ -2925,20 +3151,31 @@ class DiscordVoiceBot:
                 elif self.autoplay and self.voice_client and self.voice_client.is_connected():
                     cache_dir = AUDIO_CACHE_DIR
                     curr_vid = track.get("video_id") or extract_youtube_video_id(track.get("webpage_url", ""))
-                    random_cached = AUDIO_CACHE_INDEX.get_random_track(cache_dir, exclude_vid_id=curr_vid)
+                    played_today = self._get_autoplay_played_ids_today() if self.smart_autoplay else None
+                    random_cached = AUDIO_CACHE_INDEX.get_random_track(
+                        cache_dir, exclude_vid_id=curr_vid, exclude_vid_ids=played_today
+                    )
                     if random_cached:
                         cached_file, cached_meta = random_cached
                         auto_emoji = get_random_server_emoji(self.voice_client.guild if self.voice_client else None)
                         auto_track = create_track_from_cached_meta(cached_file, cached_meta, requester="Autoplay", emoji=auto_emoji)
                         ensure_track_title(auto_track)
-                        logger.info(f"Autoplay selecting random track from cache: {auto_track.get('title')}")
+                        auto_vid = auto_track.get("video_id") or extract_youtube_video_id(cached_file) or os.path.splitext(os.path.basename(cached_file))[0]
+                        if self.smart_autoplay:
+                            self.record_autoplay_track(auto_vid)
+                            logger.info(f"Smart Autoplay selecting unplayed cached track: {auto_track.get('title')} ({auto_vid})")
+                        else:
+                            logger.info(f"Standard Autoplay selecting cached track: {auto_track.get('title')} ({auto_vid})")
                         if self._loop and self._loop.is_running():
                             asyncio.run_coroutine_threadsafe(
                                 self._async_play_track(auto_track, announce=not is_skipped),
                                 self._loop,
                             )
                     else:
-                        logger.warning("Autoplay active, but no cached songs found in cache/. Stopping playback.")
+                        if self.smart_autoplay:
+                            logger.info("Smart Autoplay: All available cached songs have already been played today. Stopping playback.")
+                        else:
+                            logger.info("Autoplay: No cached tracks found in cache/. Stopping playback.")
                         self.is_playing = False
                         self.is_paused = False
                         self.current_track = None
@@ -3074,12 +3311,18 @@ class DiscordVoiceBot:
             curr_vid = ""
             if self.current_track:
                 curr_vid = self.current_track.get("video_id") or extract_youtube_video_id(self.current_track.get("webpage_url", ""))
-            random_cached = AUDIO_CACHE_INDEX.get_random_track(cache_dir, exclude_vid_id=curr_vid)
+            played_today = self._get_autoplay_played_ids_today() if self.smart_autoplay else None
+            random_cached = AUDIO_CACHE_INDEX.get_random_track(
+                cache_dir, exclude_vid_id=curr_vid, exclude_vid_ids=played_today
+            )
             if random_cached:
                 cached_file, cached_meta = random_cached
                 auto_emoji = get_random_server_emoji(guild)
                 auto_track = create_track_from_cached_meta(cached_file, cached_meta, requester="Autoplay", emoji=auto_emoji)
                 ensure_track_title(auto_track)
+                auto_vid = auto_track.get("video_id") or extract_youtube_video_id(cached_file) or os.path.splitext(os.path.basename(cached_file))[0]
+                if self.smart_autoplay:
+                    self.record_autoplay_track(auto_vid)
                 self.queue.append(auto_track)
                 return auto_track
         return None
@@ -3147,14 +3390,33 @@ class DiscordVoiceBot:
             except Exception:
                 pass
 
-    def set_autoplay(self, enabled: bool, trigger: bool = False) -> bool:
-        """Enable or disable autoplay mode."""
+    def set_autoplay(self, enabled: bool, smart: Optional[bool] = None, trigger: bool = False) -> bool:
+        """Enable or disable autoplay mode, optionally configuring smart mode."""
         self.autoplay = bool(enabled)
+        if smart is not None:
+            self.smart_autoplay = bool(smart)
         if self.autoplay and trigger:
             if self.voice_client and self.voice_client.is_connected() and not self.is_playing and not self.queue:
                 if not self.voice_client.is_playing() and not self.voice_client.is_paused():
                     self.trigger_autoplay()
         return self.autoplay
+
+    def set_smart_autoplay(self, enabled: bool) -> bool:
+        """Enable or disable smart deduplication for autoplay."""
+        self.smart_autoplay = bool(enabled)
+        return self.smart_autoplay
+
+    def get_autoplay_status(self) -> Dict[str, any]:
+        """Return current autoplay status, mode, and statistics."""
+        played_ids = self._get_autoplay_played_ids_today()
+        total_cached = AUDIO_CACHE_INDEX.count(AUDIO_CACHE_DIR)
+        return {
+            "enabled": self.autoplay,
+            "smart": self.smart_autoplay,
+            "played_today_count": len(played_ids),
+            "total_cached_count": total_cached,
+            "remaining_unplayed": max(0, total_cached - len(played_ids)),
+        }
 
     def trigger_autoplay(self) -> Optional[Dict[str, any]]:
         """Attempt to play a random cached track if autoplay is enabled and bot is idle."""
@@ -3171,14 +3433,27 @@ class DiscordVoiceBot:
         curr_vid = ""
         if self.current_track:
             curr_vid = self.current_track.get("video_id") or extract_youtube_video_id(self.current_track.get("webpage_url", ""))
-        random_cached = AUDIO_CACHE_INDEX.get_random_track(cache_dir, exclude_vid_id=curr_vid)
+        played_today = self._get_autoplay_played_ids_today() if self.smart_autoplay else None
+        random_cached = AUDIO_CACHE_INDEX.get_random_track(
+            cache_dir, exclude_vid_id=curr_vid, exclude_vid_ids=played_today
+        )
         if random_cached:
             cached_file, cached_meta = random_cached
             auto_emoji = get_random_server_emoji(self.voice_client.guild if self.voice_client else None)
             auto_track = create_track_from_cached_meta(cached_file, cached_meta, requester="Autoplay", emoji=auto_emoji)
             ensure_track_title(auto_track)
-            print(f"[DiscordBot] Autoplay starting random cached track: {auto_track.get('title')}")
+            auto_vid = auto_track.get("video_id") or extract_youtube_video_id(cached_file) or os.path.splitext(os.path.basename(cached_file))[0]
+            if self.smart_autoplay:
+                self.record_autoplay_track(auto_vid)
+                logger.info(f"Smart Autoplay starting unplayed cached track: {auto_track.get('title')} ({auto_vid})")
+            else:
+                logger.info(f"Standard Autoplay starting cached track: {auto_track.get('title')} ({auto_vid})")
             if self._loop and self._loop.is_running():
                 asyncio.run_coroutine_threadsafe(self._async_play_track(auto_track), self._loop)
             return auto_track
+        else:
+            if self.smart_autoplay:
+                logger.info("Smart Autoplay: All available cached songs have already been played today.")
+            else:
+                logger.info("Autoplay: No cached tracks found in cache/.")
         return None

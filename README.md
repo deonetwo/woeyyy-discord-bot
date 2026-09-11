@@ -16,7 +16,7 @@ The project is completely headless, with no GUI dependencies or local audio devi
 - **Instant Cache Bypass & LRU Storage**: Repeated songs and cached tracks start playing instantly (<10ms) while an automatic LRU cleaner keeps storage capped (`MAX_CACHE_MB=500`, `MAX_CACHE_FILES=50`).
 - **Slash Commands & Autocomplete**: Autocomplete suggestions appear in chat when typing `/play`, prioritizing your recent playback history.
 - **Stream Auto-Recovery**: Automatically detects premature stream termination and falls back to cached download.
-- **Queue Management**: Enqueues tracks, automatically advances to the next song, and supports track skipping.
+- **Smart Autoplay & Queue Management**: Enqueues tracks, automatically advances to the next song, and features Smart Autoplay (plays unplayed cached songs with daily rollover so no song repeats on the same day).
 - **Input Sanitization & Process Isolation**: Single-instance mutex on Windows, SSRF prevention on user-supplied URLs, and safe token storage.
 - **Dual Execution Modes**: Interactive CLI mode for manual testing and background daemon mode for production servers.
 
@@ -34,7 +34,8 @@ The project is completely headless, with no GUI dependencies or local audio devi
 | `/queue` | Display current track queue |
 | `/clear` | Clear the track queue |
 | `/stop` | Stop playback and clear queue |
-| `/autoplay [mode]` | Control autoplay mode (`on`/`off` or interactive dropdown) |
+| `/autoplay [mode]` | Control autoplay mode (`smart`, `standard`, `on`, `off`, `reset`, `status`, or interactive dropdown) |
+| `/smartautoplay [action]` | Shortcut for Smart Autoplay (`on`, `off`, `reset`, `status`) |
 | `/volume <0-150>` | Set playback volume percentage |
 | `/leave` | Disconnect bot from voice channel |
 
@@ -48,7 +49,8 @@ When running interactively (`python main.py`):
 - `q, queue`: Display queue status
 - `pause` / `resume`: Pause or resume playback
 - `stop`: Stop playback and clear queue
-- `a, autoplay [on/off]`: Enable or disable autoplay mode
+- `a, autoplay [mode]`: Control autoplay (`smart`, `standard`, `off`, `reset`, `status`)
+- `smartautoplay [mode]`: Shortcut to manage Smart Autoplay
 - `v, vol <0-150>`: Set volume percentage
 - `logs [n]`: Show recent bot operational logs (default: 20)
 - `help`: Display help message
