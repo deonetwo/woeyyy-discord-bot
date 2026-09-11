@@ -174,6 +174,41 @@ def clean_artist_name(uploader: str) -> str:
     return u
 
 
+def clean_search_query(q: str) -> str:
+    """
+    Remove excessive punctuation, quotes, and parenthetical metadata from a search query
+    (e.g., '(from 2010 "OK Bartender" album) (edited by Richard Cheese)' -> '')
+    to allow YouTube search to find matching working uploads when strict exact matches are unavailable.
+    """
+    if not q:
+        return ""
+    # Strip quotes
+    cleaned = re.sub(r'["\']', '', q)
+    # Strip parenthetical annotations: (from ...), [official video], (audio), etc.
+    cleaned = re.sub(r'\s*\([^)]*\)', '', cleaned)
+    cleaned = re.sub(r'\s*\[[^\]]*\]', '', cleaned)
+    return re.sub(r'\s+', ' ', cleaned).strip()
+
+
+def is_relevant_search_candidate(candidate_title: str, query: str) -> bool:
+    """
+    Check if a search candidate title is relevant to the user query, especially
+    when the query specifies quoted song titles or specific words.
+    Prevents YouTube fallback from playing completely unrelated songs from the same artist/album.
+    """
+    if not candidate_title:
+        return False
+    title_lower = candidate_title.lower()
+    # If the query had quotes (e.g. "My Neck My Back"), require matching at least one significant word
+    quotes = re.findall(r'["\']([^"\']+)["\']', query)
+    if quotes:
+        for q_str in quotes:
+            core_words = [w.lower() for w in re.findall(r'[a-zA-Z0-9]+', q_str) if len(w) > 2]
+            if core_words and not any(w in title_lower for w in core_words):
+                return False
+    return True
+
+
 def format_now_playing_status(emoji: str, title: str, uploader: str = "") -> str:
     """Format voice channel status as: {emoji} Now Playing: {bold_title} • {bold_uploader}."""
     prefix = f"{emoji} " if emoji else ""
@@ -661,8 +696,7 @@ class AudioCacheIndex:
             return None, None
 
         clean_query = query.strip().lower()
-        if clean_query.startswith("ytsearch1:"):
-            clean_query = clean_query[10:].strip()
+        clean_query = re.sub(r"^ytsearch\d*:\s*", "", clean_query)
 
         if clean_query.startswith("http://") or clean_query.startswith("https://"):
             return None, None
@@ -2270,8 +2304,8 @@ class DiscordVoiceBot:
             if not is_safe:
                 return False, f"Security: URL rejected ({reason})", False, {}
 
-            if not (sanitized_target.startswith("http://") or sanitized_target.startswith("https://")):
-                sanitized_target = f"ytsearch1:{sanitized_target}"
+            if not (sanitized_target.startswith("http://") or sanitized_target.startswith("https://") or sanitized_target.startswith("ytsearch")):
+                sanitized_target = f"ytsearch5:{sanitized_target}"
 
             cache_dir = AUDIO_CACHE_DIR
             os.makedirs(cache_dir, exist_ok=True)
@@ -2353,11 +2387,11 @@ class DiscordVoiceBot:
                     "audioformat": "opus",
                     "noplaylist": True,
                     "nocheckcertificate": False,
-                    "ignoreerrors": False,
+                    "ignoreerrors": True,
                     "logtostderr": False,
                     "quiet": True,
                     "no_warnings": True,
-                    "default_search": "ytsearch1:",
+                    "default_search": "ytsearch5:",
                     "source_address": "0.0.0.0",
                 }
                 try:
@@ -2370,9 +2404,24 @@ class DiscordVoiceBot:
 
                 if data and "entries" in data:
                     entries = [e for e in data["entries"] if e]
-                    data = entries[0] if entries else None
-
-                if data:
+                    for candidate in entries:
+                        d_url = candidate.get("url")
+                        h_hdrs = candidate.get("http_headers", {})
+                        if not d_url and "formats" in candidate:
+                            audio_formats = [
+                                f for f in candidate["formats"]
+                                if f.get("url") and (f.get("vcodec") == "none" or "audio" in f.get("format", "").lower() or f.get("acodec") != "none")
+                            ]
+                            if audio_formats:
+                                d_url = audio_formats[-1].get("url")
+                                if "http_headers" in audio_formats[-1]:
+                                    h_hdrs = audio_formats[-1].get("http_headers")
+                        if d_url:
+                            direct_url = d_url
+                            http_headers = h_hdrs
+                            data = candidate
+                            break
+                elif data:
                     direct_url = data.get("url")
                     http_headers = data.get("http_headers", {})
                     if not direct_url and "formats" in data:
@@ -2389,31 +2438,80 @@ class DiscordVoiceBot:
             # Fallback or Server Mode: Download to cache folder
             if not direct_url:
                 res_vid = vid_id or extract_youtube_video_id(sanitized_target)
+                candidates = []
 
-                # 1. If searching by query (not a direct video URL), perform super fast flat search (~300ms)
+                # 1. If searching by query (not a direct video URL), perform fast multi-candidate flat search
                 if not res_vid:
                     search_opts = dict(YTDL_OPTIONS)
                     search_opts["noplaylist"] = True
                     search_opts["extract_flat"] = True
 
+                    search_target = sanitized_target
+                    if search_target.startswith("ytsearch1:"):
+                        search_target = f"ytsearch5:{search_target[10:]}"
+                    elif not (search_target.startswith("http://") or search_target.startswith("https://") or search_target.startswith("ytsearch")):
+                        search_target = f"ytsearch5:{search_target}"
+
                     try:
                         ytdl_search = yt_dlp.YoutubeDL(search_opts)
                         data = await loop.run_in_executor(
-                            None, lambda: ytdl_search.extract_info(sanitized_target, download=False)
+                            None, lambda: ytdl_search.extract_info(search_target, download=False)
                         )
                     except Exception as search_err:
                         print(f"[DiscordBot] Search metadata extraction error ({search_err}), proceeding to download...")
                         data = None
 
                     if data and "entries" in data:
-                        entries = [e for e in data["entries"] if e]
-                        data = entries[0] if entries else None
+                        candidates = [e for e in data["entries"] if e]
+                    elif data:
+                        candidates = [data]
+
+                    # Filter candidates by title relevance if query has quotes
+                    rel_candidates = [c for c in candidates if is_relevant_search_candidate(c.get("title", ""), query_or_url)]
+
+                    # If few relevant candidates and query has parenthetical/quoted annotations, fallback to cleaned query
+                    cleaned_q = clean_search_query(query_or_url)
+                    if len(rel_candidates) < 2 and cleaned_q and cleaned_q.lower() != query_or_url.strip().lower():
+                        try:
+                            clean_target = f"ytsearch5:{cleaned_q}"
+                            data_clean = await loop.run_in_executor(
+                                None, lambda: ytdl_search.extract_info(clean_target, download=False)
+                            )
+                            if data_clean and "entries" in data_clean:
+                                existing_ids = {c.get("id") for c in rel_candidates if c.get("id")}
+                                for c in data_clean["entries"]:
+                                    if c and c.get("id") and c.get("id") not in existing_ids:
+                                        if is_relevant_search_candidate(c.get("title", ""), cleaned_q):
+                                            rel_candidates.append(c)
+                                            existing_ids.add(c.get("id"))
+                        except Exception as clean_err:
+                            print(f"[DiscordBot] Clean query search notice: {clean_err}")
+
+                    candidates = rel_candidates or candidates
+                    data = candidates[0] if candidates else None
 
                     if data:
                         res_vid = data.get("id") or extract_youtube_video_id(data.get("url", "")) or extract_youtube_video_id(data.get("webpage_url", ""))
 
-                # 2. Check if the resolved video ID is ALREADY in local cache!
-                if res_vid:
+                # 2. Check if ANY candidate video ID is ALREADY in local cache!
+                if not direct_url and candidates:
+                    for c in candidates:
+                        cand_id = c.get("id") or extract_youtube_video_id(c.get("url", "")) or extract_youtube_video_id(c.get("webpage_url", ""))
+                        if cand_id:
+                            cached_file, cached_meta = find_cached_track(cache_dir, cand_id)
+                            if cached_file and os.path.exists(cached_file):
+                                filepath = cached_file
+                                direct_url = cached_file
+                                res_vid = cand_id
+                                data = c
+                                if cached_meta:
+                                    if not data.get("title") and cached_meta.get("title"):
+                                        data["title"] = cached_meta["title"]
+                                    if not data.get("uploader") and cached_meta.get("uploader"):
+                                        data["uploader"] = cached_meta["uploader"]
+                                break
+
+                if not direct_url and res_vid:
                     cached_file, cached_meta = find_cached_track(cache_dir, res_vid)
                     if cached_file and os.path.exists(cached_file):
                         filepath = cached_file
@@ -2426,60 +2524,90 @@ class DiscordVoiceBot:
                             if not data.get("uploader") and cached_meta.get("uploader"):
                                 data["uploader"] = cached_meta["uploader"]
 
-                # 3. Only download from YouTube if the audio file is NOT in cache (Single-Pass)
+                # 3. Only download from YouTube if the audio file is NOT in cache (Single-Pass with candidate fallback)
                 if not direct_url:
                     dl_opts = dict(YTDL_OPTIONS)
                     dl_opts["outtmpl"] = os.path.join(cache_dir, "%(id)s.%(ext)s")
                     dl_opts["noplaylist"] = True
                     dl_opts.pop("extract_flat", None)
 
-                    if res_vid:
-                        dl_target = f"https://www.youtube.com/watch?v={res_vid}"
-                    else:
-                        dl_target = (data.get("webpage_url") if data else None) or (data.get("url") if data else None) or sanitized_target
+                    # Build target candidate list to try
+                    targets_to_try = []
+                    if candidates:
+                        for c in candidates:
+                            c_id = c.get("id") or extract_youtube_video_id(c.get("url", "")) or extract_youtube_video_id(c.get("webpage_url", ""))
+                            if c_id:
+                                targets_to_try.append((f"https://www.youtube.com/watch?v={c_id}", c_id, c))
+                    if not targets_to_try:
+                        if res_vid:
+                            targets_to_try.append((f"https://www.youtube.com/watch?v={res_vid}", res_vid, data))
+                        else:
+                            fallback_t = (data.get("webpage_url") if data else None) or (data.get("url") if data else None) or sanitized_target
+                            targets_to_try.append((fallback_t, "", data))
 
-                    try:
-                        ytdl_dl = yt_dlp.YoutubeDL(dl_opts)
-                        dl_data = await loop.run_in_executor(
-                            None, lambda: ytdl_dl.extract_info(dl_target, download=True)
-                        )
-                        if dl_data:
-                            data = dl_data
-                    except Exception as dl_err:
-                        if "cookiefile" in dl_opts:
-                            print(f"[DiscordBot] Download with cookies encountered error ({dl_err}), retrying without cookies...")
-                            clean_dl_opts = {
-                                "format": "bestaudio/best",
-                                "outtmpl": os.path.join(cache_dir, "%(id)s.%(ext)s"),
-                                "noplaylist": True,
-                                "quiet": True,
-                                "source_address": "0.0.0.0",
-                                "buffersize": 131072,
-                                "http_chunk_size": 10485760,
-                            }
-                            ytdl_dl = yt_dlp.YoutubeDL(clean_dl_opts)
+                    last_error = None
+                    ytdl_active = None
+                    for dl_target, cand_id, cand_data in targets_to_try:
+                        try:
+                            ytdl_dl = yt_dlp.YoutubeDL(dl_opts)
                             dl_data = await loop.run_in_executor(
                                 None, lambda: ytdl_dl.extract_info(dl_target, download=True)
                             )
                             if dl_data:
                                 data = dl_data
-                        else:
-                            raise dl_err
+                                ytdl_active = ytdl_dl
+                                if cand_id:
+                                    res_vid = cand_id
+                                break
+                        except Exception as dl_err:
+                            err_str = str(dl_err).lower()
+                            last_error = dl_err
+                            is_auth_error = any(kw in err_str for kw in ["cookie", "login", "authenticate", "account", "confirm you're not a bot"])
+                            is_unavail = any(kw in err_str for kw in ["unavailable", "removed", "private", "not available"])
+
+                            if "cookiefile" in dl_opts and is_auth_error and not is_unavail:
+                                print(f"[DiscordBot] Download with cookies encountered auth error ({dl_err}), retrying without cookies...")
+                                clean_dl_opts = {
+                                    "format": "bestaudio/best",
+                                    "outtmpl": os.path.join(cache_dir, "%(id)s.%(ext)s"),
+                                    "noplaylist": True,
+                                    "quiet": True,
+                                    "source_address": "0.0.0.0",
+                                    "buffersize": 131072,
+                                    "http_chunk_size": 10485760,
+                                }
+                                try:
+                                    ytdl_clean = yt_dlp.YoutubeDL(clean_dl_opts)
+                                    dl_data = await loop.run_in_executor(
+                                        None, lambda: ytdl_clean.extract_info(dl_target, download=True)
+                                    )
+                                    if dl_data:
+                                        data = dl_data
+                                        ytdl_active = ytdl_clean
+                                        if cand_id:
+                                            res_vid = cand_id
+                                        break
+                                except Exception as clean_err:
+                                    print(f"[DiscordBot] Retry without cookies failed ({clean_err})")
+                                    last_error = dl_err
+                            else:
+                                print(f"[DiscordBot] Search candidate {cand_id or dl_target} unavailable ({dl_err}), trying next candidate...")
 
                     if data and "entries" in data:
                         entries = [e for e in data["entries"] if e]
                         if not entries:
-                            return False, "Track not found.", False, {}
+                            return False, f"Track unavailable ({last_error or 'no playable stream'})", False, {}
                         data = entries[0]
 
                     if not data:
-                        return False, "Track not found.", False, {}
+                        return False, f"Track unavailable ({last_error or 'not found'})", False, {}
 
-                    filepath = ytdl_dl.prepare_filename(data)
+                    prep_ydl = ytdl_active or yt_dlp.YoutubeDL(dl_opts)
+                    filepath = prep_ydl.prepare_filename(data)
                     if not os.path.exists(filepath):
-                        vid_id = data.get("id", "")
+                        target_id = data.get("id", "") or res_vid
                         for fname in os.listdir(cache_dir):
-                            if fname.startswith(vid_id):
+                            if target_id and fname.startswith(target_id):
                                 filepath = os.path.join(cache_dir, fname)
                                 break
                     direct_url = filepath
@@ -2681,7 +2809,10 @@ class DiscordVoiceBot:
                                             None, lambda: ytdl_dl.extract_info(track["webpage_url"], download=True)
                                         )
                                     except Exception as dl_err:
-                                        if "cookiefile" in dl_opts:
+                                        err_str = str(dl_err).lower()
+                                        is_auth_error = any(kw in err_str for kw in ["cookie", "login", "authenticate", "account", "confirm you're not a bot"])
+                                        is_unavail = any(kw in err_str for kw in ["unavailable", "removed", "private", "not available"])
+                                        if "cookiefile" in dl_opts and is_auth_error and not is_unavail:
                                             print(f"[DiscordBot] Fallback download with cookies failed ({dl_err}), retrying without cookies...")
                                             clean_dl_opts = {
                                                 "format": "bestaudio/best",
@@ -2692,10 +2823,15 @@ class DiscordVoiceBot:
                                                 "buffersize": 131072,
                                                 "http_chunk_size": 10485760,
                                             }
-                                            ytdl_dl = yt_dlp.YoutubeDL(clean_dl_opts)
-                                            fallback_data = await self._loop.run_in_executor(
-                                                None, lambda: ytdl_dl.extract_info(track["webpage_url"], download=True)
-                                            )
+                                            try:
+                                                ytdl_clean = yt_dlp.YoutubeDL(clean_dl_opts)
+                                                fallback_data = await self._loop.run_in_executor(
+                                                    None, lambda: ytdl_clean.extract_info(track["webpage_url"], download=True)
+                                                )
+                                                ytdl_dl = ytdl_clean
+                                            except Exception as clean_err:
+                                                print(f"[DiscordBot] Fallback retry without cookies failed ({clean_err})")
+                                                raise dl_err
                                         else:
                                             raise dl_err
 

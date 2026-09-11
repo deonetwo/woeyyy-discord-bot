@@ -1268,6 +1268,68 @@ class TestDiscordVoiceBot(unittest.TestCase):
             self.assertIn("by **Random Artist**", sent_msg)
             self.assertIn("(`4:00`)", sent_msg)
 
+    def test_clean_search_query(self):
+        """Test query cleaning strips quotes and parenthetical metadata."""
+        from engine.discord_bot import clean_search_query
+        q = 'Richard Cheese "My Neck My Back" (from 2010 "OK Bartender" album) (edited by Richard Cheese)'
+        cleaned = clean_search_query(q)
+        self.assertEqual(cleaned, "Richard Cheese My Neck My Back")
+
+        q2 = "Queen - Bohemian Rhapsody [Official Video] (Remastered 2011)"
+        cleaned2 = clean_search_query(q2)
+        self.assertEqual(cleaned2, "Queen - Bohemian Rhapsody")
+
+    def test_is_relevant_search_candidate(self):
+        """Test candidate relevance checks when quoted terms are present in query."""
+        from engine.discord_bot import is_relevant_search_candidate
+        q = 'Richard Cheese "My Neck My Back"'
+        self.assertTrue(is_relevant_search_candidate('Richard Cheese "My Neck My Back (Live)"', q))
+        self.assertFalse(is_relevant_search_candidate('Richard Cheese - Smack That', q))
+
+    def test_async_enqueue_or_play_candidate_fallback(self):
+        """Test that _async_enqueue_or_play falls back to next candidate when top result is unavailable."""
+        bot = DiscordVoiceBot(is_local=False)
+        bot._async_play_track = AsyncMock()
+
+        # Mock yt_dlp.YoutubeDL
+        candidate_entries = [
+            {"id": "dead_vid_1", "title": "Dead Song 1"},
+            {"id": "live_vid_2", "title": "Live Song 2", "duration": 180, "uploader": "Artist 2"},
+        ]
+
+        from engine.discord_bot import AUDIO_CACHE_DIR
+
+        class FakeYtdl:
+            def __init__(self, opts=None):
+                self.opts = opts or {}
+
+            def extract_info(self, url, download=False):
+                if "ytsearch" in url:
+                    return {"entries": candidate_entries}
+                if "dead_vid_1" in url:
+                    raise Exception("ERROR: [youtube] dead_vid_1: Video unavailable")
+                if "live_vid_2" in url:
+                    return {
+                        "id": "live_vid_2",
+                        "title": "Live Song 2",
+                        "duration": 180,
+                        "uploader": "Artist 2",
+                        "webpage_url": "https://www.youtube.com/watch?v=live_vid_2",
+                    }
+                raise Exception("Unknown target")
+
+            def prepare_filename(self, data):
+                return os.path.join(AUDIO_CACHE_DIR, f"{data.get('id')}.opus")
+
+        with patch("engine.discord_bot.yt_dlp.YoutubeDL", side_effect=FakeYtdl), \
+             patch("engine.discord_bot.os.path.exists", return_value=True):
+            success, msg, is_queued, track = asyncio.run(
+                bot._async_enqueue_or_play("Dead Song")
+            )
+            self.assertTrue(success)
+            self.assertEqual(track.get("video_id"), "live_vid_2")
+            self.assertEqual(track.get("title"), "Live Song 2")
+
 
 if __name__ == "__main__":
     unittest.main()
