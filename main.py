@@ -16,6 +16,7 @@ if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 from engine.discord_bot import DiscordVoiceBot, load_saved_token, save_token
+from engine.logger import get_recent_logs
 from engine.security import SingleInstanceLock, mask_token
 
 
@@ -63,6 +64,7 @@ def print_help():
     print("  stop                  - Stop playback and clear queue")
     print("  a, autoplay [on/off]  - Toggle or set autoplay (plays random cache songs)")
     print("  v, vol <0-150>        - Set playback volume percentage")
+    print("  logs [n]              - Show recent bot operational logs (default: 20)")
     print("  help                  - Show this help list")
     print("  exit, quit            - Disconnect and exit\n")
 
@@ -287,6 +289,22 @@ def main():
                         print(f"Volume set to {int(val * 100)}%")
                     except ValueError:
                         print("Invalid volume. Enter a number between 0 and 150.")
+
+            elif cmd in ("logs", "log"):
+                try:
+                    count = int(arg) if arg else 20
+                    count = max(1, min(100, count))
+                except ValueError:
+                    print("Invalid count. Enter a number between 1 and 100.")
+                    continue
+                recent = get_recent_logs(limit=count)
+                if not recent:
+                    print("No log entries recorded yet.")
+                else:
+                    print(f"\n--- Recent Logs ({len(recent)} entries) ---")
+                    for line in recent:
+                        print(line)
+                    print("------------------------------------------")
 
             else:
                 print(f"Unknown command '{cmd}'. Type 'help' for available commands.")

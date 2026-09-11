@@ -39,6 +39,9 @@ from engine.security import (
     secure_file_permissions,
     sanitize_audio_target,
 )
+from engine.logger import get_logger
+
+logger = get_logger("DiscordBot")
 
 
 
@@ -936,7 +939,7 @@ def save_track_cache_meta(cache_dir: str, vid_id: str, meta: Dict[str, any]):
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"[DiscordBot] Notice: failed to save track cache meta for {vid_id}: {e}")
+        logger.warning(f"Failed to save track cache meta for {vid_id}: {e}")
 
 
 def resolve_track_metadata(
@@ -1082,7 +1085,7 @@ def prune_audio_cache(
             pass
 
     if pruned_count > 0:
-        print(f"[DiscordBot] Cache auto-prune: removed {pruned_count} old audio files to maintain storage quota.")
+        logger.info(f"Cache auto-prune: removed {pruned_count} old audio files to maintain storage quota.")
 
 
 def load_user_history() -> Dict[str, List[Dict[str, any]]]:
@@ -1097,7 +1100,7 @@ def load_user_history() -> Dict[str, List[Dict[str, any]]]:
                 if isinstance(data, dict):
                     return data
         except Exception as e:
-            print(f"[DiscordBot] Warning: failed to load user history: {e}")
+            logger.warning(f"Failed to load user history: {e}")
     return {}
 
 
@@ -1113,7 +1116,7 @@ def save_user_history(history: Dict[str, List[Dict[str, any]]]):
             with open(USER_HISTORY_PATH, "w", encoding="utf-8") as f:
                 json.dump(history, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            print(f"[DiscordBot] Warning: failed to save user history: {e}")
+            logger.warning(f"Failed to save user history: {e}")
 
 
 def load_saved_token() -> str:
@@ -1612,10 +1615,14 @@ class DiscordVoiceBot:
                 await self._ensure_voice_connected(channel)
                 emoji = get_random_server_emoji(interaction.guild)
                 prefix = f"{emoji} " if emoji else ""
+                logger.info(f"Voice connected to channel '#{channel.name}' via /join")
                 await interaction.followup.send(f"{prefix}Connected to **#{channel.name}**")
             except Exception as e:
-                print(f"[DiscordBot] Error connecting to voice channel: {e}")
-                await interaction.followup.send(f"Failed to connect to voice channel: {e}")
+                logger.error(f"Error connecting to voice channel: {e}")
+                await interaction.followup.send(
+                    "Failed to connect to voice channel. Please ensure the bot has permission to join and speak.",
+                    ephemeral=True,
+                )
 
         @bot.tree.command(name="play", description="Play a track from YouTube or add it to the queue")
         @app_commands.describe(query="Song title, YouTube URL, or YouTube Music URL")
@@ -1634,8 +1641,11 @@ class DiscordVoiceBot:
             try:
                 await self._ensure_voice_connected(channel)
             except Exception as e:
-                print(f"[DiscordBot] Error connecting to voice channel: {e}")
-                await interaction.followup.send(f"Failed to connect to voice channel: {e}")
+                logger.error(f"Error connecting to voice channel: {e}")
+                await interaction.followup.send(
+                    "Failed to connect to voice channel. Please ensure the bot has permission to join and speak.",
+                    ephemeral=True,
+                )
                 return
 
             # Send immediate feedback tailored to input type
@@ -1653,7 +1663,8 @@ class DiscordVoiceBot:
                 )
 
                 if not success:
-                    await msg_handle.edit(content=f"Error: {msg}")
+                    logger.warning(f"Failed to load audio for '{query}': {msg}")
+                    await msg_handle.edit(content="Could not load audio. Please check the song title or URL and try again.")
                     return
 
                 # Record track to user's history immediately upon retrieval
@@ -1680,9 +1691,9 @@ class DiscordVoiceBot:
 
                 await msg_handle.edit(content=msg_text)
             except Exception as e:
-                print(f"[DiscordBot] Error during /play command execution: {e}")
+                logger.error(f"Error during /play command execution: {e}")
                 try:
-                    await msg_handle.edit(content=f"Error: {e}")
+                    await msg_handle.edit(content="Could not load audio. Please check the song title or URL and try again.")
                 except Exception:
                     pass
 
@@ -2004,18 +2015,21 @@ class DiscordVoiceBot:
                     view = AutoplaySelectView(self.autoplay)
                     await interaction.followup.send(msg, view=view)
             except Exception as e:
-                print(f"[DiscordBot] Error in cmd_autoplay: {e}")
+                logger.error(f"Error in cmd_autoplay: {e}")
                 try:
-                    await interaction.followup.send(f"Error handling autoplay: {e}", ephemeral=True)
+                    await interaction.followup.send(
+                        "An error occurred while changing autoplay settings. Please try again.",
+                        ephemeral=True,
+                    )
                 except Exception:
                     pass
 
         @bot.tree.error
         async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
             cmd_name = interaction.command.name if interaction.command else "unknown"
-            print(f"[DiscordBot] AppCommand error on /{cmd_name}: {error}")
+            logger.error(f"AppCommand error on /{cmd_name}: {error}")
             try:
-                msg = f"Command error on `/{cmd_name}`: {error}"
+                msg = "An error occurred while executing this command. Please try again."
                 if interaction.response.is_done():
                     await interaction.followup.send(msg, ephemeral=True)
                 else:
@@ -2042,7 +2056,7 @@ class DiscordVoiceBot:
         async def on_ready():
             self.is_connected = True
             bot_name = str(self.client.user)
-            print(f"[DiscordBot] Logged in successfully as {bot_name}")
+            logger.info(f"Logged in successfully as {bot_name}")
             self._refresh_voice_channels_internal()
             self._notify_status("ONLINE", bot_name)
 
@@ -2052,9 +2066,9 @@ class DiscordVoiceBot:
                     self.client.tree.copy_global_to(guild=guild)
                     await self.client.tree.sync(guild=guild)
                 await self.client.tree.sync()
-                print("[DiscordBot] Slash commands (/) synced successfully to all servers!")
+                logger.info("Slash commands (/) synced successfully to all servers!")
             except Exception as e:
-                print(f"[DiscordBot] Note on syncing slash commands: {e}")
+                logger.warning(f"Note on syncing slash commands: {e}")
 
             # Start background smart auto-leave monitor task
             if self._auto_leave_task is None or self._auto_leave_task.done():
@@ -2260,8 +2274,8 @@ class DiscordVoiceBot:
                         if self._empty_since is None:
                             self._empty_since = now
                         elif (now - self._empty_since) >= self.auto_leave_empty_timeout:
-                            print(
-                                f"[DiscordBot] Auto-leaving voice channel: channel '#{channel.name}' has been empty for {self.auto_leave_empty_timeout}s."
+                            logger.info(
+                                f"Auto-leaving voice channel: channel '#{channel.name}' has been empty for {self.auto_leave_empty_timeout}s."
                             )
                             self._empty_since = None
                             self._idle_since = None
@@ -2276,8 +2290,8 @@ class DiscordVoiceBot:
                         if self._idle_since is None:
                             self._idle_since = now
                         elif (now - self._idle_since) >= self.auto_leave_idle_timeout:
-                            print(
-                                f"[DiscordBot] Auto-leaving voice channel: idle timeout reached ({self.auto_leave_idle_timeout}s without playback)."
+                            logger.info(
+                                f"Auto-leaving voice channel: idle timeout reached ({self.auto_leave_idle_timeout}s without playback)."
                             )
                             self._idle_since = None
                             self._empty_since = None
@@ -2458,7 +2472,7 @@ class DiscordVoiceBot:
                             None, lambda: ytdl_search.extract_info(search_target, download=False)
                         )
                     except Exception as search_err:
-                        print(f"[DiscordBot] Search metadata extraction error ({search_err}), proceeding to download...")
+                        logger.warning(f"Search metadata extraction notice ({search_err}), proceeding to download...")
                         data = None
 
                     if data and "entries" in data:
@@ -2485,7 +2499,7 @@ class DiscordVoiceBot:
                                             rel_candidates.append(c)
                                             existing_ids.add(c.get("id"))
                         except Exception as clean_err:
-                            print(f"[DiscordBot] Clean query search notice: {clean_err}")
+                            logger.info(f"Clean query search notice: {clean_err}")
 
                     candidates = rel_candidates or candidates
                     data = candidates[0] if candidates else None
@@ -2566,7 +2580,7 @@ class DiscordVoiceBot:
                             is_unavail = any(kw in err_str for kw in ["unavailable", "removed", "private", "not available"])
 
                             if "cookiefile" in dl_opts and is_auth_error and not is_unavail:
-                                print(f"[DiscordBot] Download with cookies encountered auth error ({dl_err}), retrying without cookies...")
+                                logger.warning(f"Download with cookies encountered auth error ({dl_err}), retrying without cookies...")
                                 clean_dl_opts = {
                                     "format": "bestaudio/best",
                                     "outtmpl": os.path.join(cache_dir, "%(id)s.%(ext)s"),
@@ -2588,10 +2602,10 @@ class DiscordVoiceBot:
                                             res_vid = cand_id
                                         break
                                 except Exception as clean_err:
-                                    print(f"[DiscordBot] Retry without cookies failed ({clean_err})")
+                                    logger.warning(f"Retry without cookies failed ({clean_err})")
                                     last_error = dl_err
                             else:
-                                print(f"[DiscordBot] Search candidate {cand_id or dl_target} unavailable ({dl_err}), trying next candidate...")
+                                logger.info(f"Search candidate {cand_id or dl_target} unavailable ({dl_err}), trying next candidate...")
 
                     if data and "entries" in data:
                         entries = [e for e in data["entries"] if e]
@@ -2677,16 +2691,18 @@ class DiscordVoiceBot:
             # Check if playback is currently active
             if self.is_playing or self.is_paused:
                 self.queue.append(track)
+                logger.info(f"Enqueued '{track.get('title')}' (#{len(self.queue)}) requested by {requester}")
                 self._notify_status("ENQUEUED", track.get("title", query_or_url))
                 self._notify_status("QUEUE_UPDATED", "")
                 return True, "Added to queue", True, track
             else:
+                logger.info(f"Now playing '{track.get('title')}' requested by {requester}")
                 await self._async_play_track(track)
                 return True, "Now playing", False, track
 
         except Exception as e:
-            print(f"[DiscordBot] Failed to enqueue or play: {e}")
-            return False, str(e), False, {}
+            logger.error(f"Failed to enqueue or play: {e}")
+            return False, "Failed to load audio track", False, {}
 
     async def _async_play_track(self, track: Dict[str, any], announce: bool = False):
         """Play track on current voice_client (using direct stream URL or cached file)."""
@@ -2788,12 +2804,12 @@ class DiscordVoiceBot:
                         actual_error = f"Stream ended prematurely after {elapsed:.1f}s"
 
                     if actual_error:
-                        print(f"[DiscordBot] Playback error: {actual_error}")
+                        logger.error(f"Playback error: {actual_error}")
                         self._notify_status("ERROR", f"Playback error: {actual_error}")
 
                     # If direct stream failed immediately, fallback automatically to download mode
                     if actual_error and track.get("is_stream") and not track.get("_retried_as_download"):
-                        print(f"[DiscordBot] Stream encountered error ({actual_error}), falling back to download for: {track.get('title')}")
+                        logger.warning(f"Stream encountered error ({actual_error}), falling back to download for: {track.get('title')}")
                         track["_retried_as_download"] = True
                         if self._loop and self._loop.is_running():
                             async def _fallback_download():
@@ -2813,7 +2829,7 @@ class DiscordVoiceBot:
                                         is_auth_error = any(kw in err_str for kw in ["cookie", "login", "authenticate", "account", "confirm you're not a bot"])
                                         is_unavail = any(kw in err_str for kw in ["unavailable", "removed", "private", "not available"])
                                         if "cookiefile" in dl_opts and is_auth_error and not is_unavail:
-                                            print(f"[DiscordBot] Fallback download with cookies failed ({dl_err}), retrying without cookies...")
+                                            logger.warning(f"Fallback download with cookies failed ({dl_err}), retrying without cookies...")
                                             clean_dl_opts = {
                                                 "format": "bestaudio/best",
                                                 "outtmpl": os.path.join(cache_dir, "%(id)s.%(ext)s"),
@@ -2830,7 +2846,7 @@ class DiscordVoiceBot:
                                                 )
                                                 ytdl_dl = ytdl_clean
                                             except Exception as clean_err:
-                                                print(f"[DiscordBot] Fallback retry without cookies failed ({clean_err})")
+                                                logger.warning(f"Fallback retry without cookies failed ({clean_err})")
                                                 raise dl_err
                                         else:
                                             raise dl_err
@@ -2868,7 +2884,7 @@ class DiscordVoiceBot:
                                         await self._async_play_track(track)
                                         return
                                 except Exception as dl_err:
-                                    print(f"[DiscordBot] Fallback download failed: {dl_err}")
+                                    logger.error(f"Fallback download failed: {dl_err}")
                             asyncio.run_coroutine_threadsafe(_fallback_download(), self._loop)
                             return
 
@@ -2915,14 +2931,14 @@ class DiscordVoiceBot:
                         auto_emoji = get_random_server_emoji(self.voice_client.guild if self.voice_client else None)
                         auto_track = create_track_from_cached_meta(cached_file, cached_meta, requester="Autoplay", emoji=auto_emoji)
                         ensure_track_title(auto_track)
-                        print(f"[DiscordBot] Autoplay selecting random track from cache: {auto_track.get('title')}")
+                        logger.info(f"Autoplay selecting random track from cache: {auto_track.get('title')}")
                         if self._loop and self._loop.is_running():
                             asyncio.run_coroutine_threadsafe(
                                 self._async_play_track(auto_track, announce=not is_skipped),
                                 self._loop,
                             )
                     else:
-                        print("[DiscordBot] Autoplay active, but no cached songs found in cache/. Stopping playback.")
+                        logger.warning("Autoplay active, but no cached songs found in cache/. Stopping playback.")
                         self.is_playing = False
                         self.is_paused = False
                         self.current_track = None
@@ -2987,17 +3003,17 @@ class DiscordVoiceBot:
                         except TypeError:
                             await target_channel.send(msg)
                     except Exception as send_err:
-                        print(f"[DiscordBot] Notice: could not send now playing announcement to text channel: {send_err}")
+                        logger.warning(f"Could not send now playing announcement to text channel: {send_err}")
         except discord.opus.OpusNotLoaded:
             err_msg = "Opus library not found. Run: sudo apt install -y libopus0 libopus-dev"
-            print(f"[DiscordBot] {err_msg}")
+            logger.error(err_msg)
             self.is_playing = False
             self.is_paused = False
             self.current_track = None
             self._notify_status("ERROR", err_msg)
         except Exception as e:
             err_msg = str(e) or type(e).__name__
-            print(f"[DiscordBot] Failed to start playback: {err_msg} ({type(e).__name__})")
+            logger.error(f"Failed to start playback: {err_msg} ({type(e).__name__})")
             self.is_playing = False
             self.is_paused = False
             self.current_track = None
@@ -3024,6 +3040,7 @@ class DiscordVoiceBot:
         """Skip currently playing track and advance queue."""
         old_title = self.current_title
         self._manual_skip = True
+        logger.info(f"Skipping track: '{old_title}'")
 
         if self.voice_client and (self.voice_client.is_playing() or self.voice_client.is_paused()):
             self.voice_client.stop()

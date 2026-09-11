@@ -50,6 +50,7 @@ When running interactively (`python main.py`):
 - `stop`: Stop playback and clear queue
 - `a, autoplay [on/off]`: Enable or disable autoplay mode
 - `v, vol <0-150>`: Set volume percentage
+- `logs [n]`: Show recent bot operational logs (default: 20)
 - `help`: Display help message
 - `exit`, `quit`: Disconnect and exit
 
