@@ -120,6 +120,7 @@ YTDL_OPTIONS = {
     "no_warnings": True,
     "default_search": "ytsearch1:",
     "source_address": "0.0.0.0",
+    "js_runtimes": {"bun": {}, "deno": {}},
 }
 
 # Path to optional cookies file (used strictly as on-demand fallback when YouTube requires authentication)
@@ -2768,7 +2769,10 @@ class DiscordVoiceBot:
                     dl_opts["outtmpl"] = os.path.join(cache_dir, "%(id)s.%(ext)s")
                     dl_opts["noplaylist"] = True
                     dl_opts.pop("extract_flat", None)
-                    dl_opts.pop("cookiefile", None)
+                    if os.path.exists(COOKIE_PATH):
+                        dl_opts["cookiefile"] = COOKIE_PATH
+                    else:
+                        dl_opts.pop("cookiefile", None)
 
                     # Build target candidate list to try
                     targets_to_try = []
@@ -2804,7 +2808,25 @@ class DiscordVoiceBot:
                             is_auth_error = any(kw in err_str for kw in ["sign in", "login", "cookie", "authenticate", "account", "confirm you're not a bot", "age-restricted", "confirm your age"])
                             is_unavail = any(kw in err_str for kw in ["unavailable", "removed", "private", "not available"])
 
-                            if is_auth_error and not is_unavail and os.path.exists(COOKIE_PATH):
+                            if "cookiefile" in dl_opts and (is_auth_error or is_unavail):
+                                logger.warning(f"Download with cookies for {cand_id or dl_target} failed ({dl_err}), retrying without cookies...")
+                                clean_dl_opts = dict(dl_opts)
+                                clean_dl_opts.pop("cookiefile", None)
+                                try:
+                                    ytdl_clean = yt_dlp.YoutubeDL(clean_dl_opts)
+                                    dl_data = await loop.run_in_executor(
+                                        None, lambda: ytdl_clean.extract_info(dl_target, download=True)
+                                    )
+                                    if dl_data:
+                                        data = dl_data
+                                        ytdl_active = ytdl_clean
+                                        if cand_id:
+                                            res_vid = cand_id
+                                        break
+                                except Exception as clean_err:
+                                    logger.warning(f"Retry without cookies failed ({clean_err})")
+                                    last_error = clean_err
+                            elif "cookiefile" not in dl_opts and is_auth_error and not is_unavail and os.path.exists(COOKIE_PATH):
                                 logger.warning(f"Download for {cand_id or dl_target} requires authentication ({dl_err}), retrying with cookies...")
                                 auth_dl_opts = dict(dl_opts)
                                 auth_dl_opts["cookiefile"] = COOKIE_PATH
@@ -3037,7 +3059,10 @@ class DiscordVoiceBot:
                                     dl_opts = dict(YTDL_OPTIONS)
                                     dl_opts["outtmpl"] = os.path.join(cache_dir, "%(id)s.%(ext)s")
                                     dl_opts["noplaylist"] = True
-                                    dl_opts.pop("cookiefile", None)
+                                    if os.path.exists(COOKIE_PATH):
+                                        dl_opts["cookiefile"] = COOKIE_PATH
+                                    else:
+                                        dl_opts.pop("cookiefile", None)
                                     try:
                                         ytdl_dl = yt_dlp.YoutubeDL(dl_opts)
                                         fallback_data = await self._loop.run_in_executor(
@@ -3047,7 +3072,20 @@ class DiscordVoiceBot:
                                         err_str = str(dl_err).lower()
                                         is_auth_error = any(kw in err_str for kw in ["sign in", "login", "cookie", "authenticate", "account", "confirm you're not a bot", "age-restricted", "confirm your age"])
                                         is_unavail = any(kw in err_str for kw in ["unavailable", "removed", "private", "not available"])
-                                        if is_auth_error and not is_unavail and os.path.exists(COOKIE_PATH):
+                                        if "cookiefile" in dl_opts and (is_auth_error or is_unavail):
+                                            logger.warning(f"Fallback download with cookies failed ({dl_err}), retrying without cookies...")
+                                            clean_dl_opts = dict(dl_opts)
+                                            clean_dl_opts.pop("cookiefile", None)
+                                            try:
+                                                ytdl_clean = yt_dlp.YoutubeDL(clean_dl_opts)
+                                                fallback_data = await self._loop.run_in_executor(
+                                                    None, lambda: ytdl_clean.extract_info(track["webpage_url"], download=True)
+                                                )
+                                                ytdl_dl = ytdl_clean
+                                            except Exception as clean_retry_err:
+                                                logger.warning(f"Fallback retry without cookies failed ({clean_retry_err})")
+                                                raise dl_err
+                                        elif "cookiefile" not in dl_opts and is_auth_error and not is_unavail and os.path.exists(COOKIE_PATH):
                                             logger.warning(f"Fallback download encountered auth requirement ({dl_err}), retrying with cookies...")
                                             auth_dl_opts = dict(dl_opts)
                                             auth_dl_opts["cookiefile"] = COOKIE_PATH
