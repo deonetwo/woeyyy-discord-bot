@@ -1291,10 +1291,10 @@ class TestDiscordVoiceBot(unittest.TestCase):
         bot = DiscordVoiceBot(is_local=False)
         bot._async_play_track = AsyncMock()
 
-        # Mock yt_dlp.YoutubeDL
+        # Mock candidate entries
         candidate_entries = [
-            {"id": "dead_vid_1", "title": "Dead Song 1"},
-            {"id": "live_vid_2", "title": "Live Song 2", "duration": 180, "uploader": "Artist 2"},
+            {"id": "dead_vid_1", "title": "Dead Song 1", "url": "https://www.youtube.com/watch?v=dead_vid_1"},
+            {"id": "live_vid_2", "title": "Live Song 2", "duration": 180, "uploader": "Artist 2", "url": "https://www.youtube.com/watch?v=live_vid_2"},
         ]
 
         from engine.discord_bot import AUDIO_CACHE_DIR
@@ -1316,12 +1316,13 @@ class TestDiscordVoiceBot(unittest.TestCase):
                         "uploader": "Artist 2",
                         "webpage_url": "https://www.youtube.com/watch?v=live_vid_2",
                     }
-                raise Exception("Unknown target")
+                raise Exception(f"Unknown target: {url}")
 
             def prepare_filename(self, data):
                 return os.path.join(AUDIO_CACHE_DIR, f"{data.get('id')}.opus")
 
-        with patch("engine.discord_bot.yt_dlp.YoutubeDL", side_effect=FakeYtdl), \
+        with patch("engine.discord_bot.async_search_innertube_candidates", AsyncMock(return_value=candidate_entries)), \
+             patch("engine.discord_bot.yt_dlp.YoutubeDL", side_effect=FakeYtdl), \
              patch("engine.discord_bot.os.path.exists", return_value=True):
             success, msg, is_queued, track = asyncio.run(
                 bot._async_enqueue_or_play("Dead Song")
@@ -1329,6 +1330,48 @@ class TestDiscordVoiceBot(unittest.TestCase):
             self.assertTrue(success)
             self.assertEqual(track.get("video_id"), "live_vid_2")
             self.assertEqual(track.get("title"), "Live Song 2")
+
+    def test_async_enqueue_or_play_innertube_fallback_to_ytdl(self):
+        """Test that _async_enqueue_or_play falls back to ytsearch5 when Innertube fails or returns empty."""
+        bot = DiscordVoiceBot(is_local=False)
+        bot._async_play_track = AsyncMock()
+
+        candidate_entries = [
+            {"id": "ytdl_song_1", "title": "YTDL Song 1", "duration": 200, "uploader": "Artist YTDL", "url": "https://www.youtube.com/watch?v=ytdl_song_1"},
+        ]
+
+        from engine.discord_bot import AUDIO_CACHE_DIR
+
+        class FakeYtdl:
+            def __init__(self, opts=None):
+                self.opts = opts or {}
+
+            def extract_info(self, url, download=False):
+                if "ytsearch" in url:
+                    return {"entries": candidate_entries}
+                if "ytdl_song_1" in url:
+                    return {
+                        "id": "ytdl_song_1",
+                        "title": "YTDL Song 1",
+                        "duration": 200,
+                        "uploader": "Artist YTDL",
+                        "webpage_url": "https://www.youtube.com/watch?v=ytdl_song_1",
+                    }
+                raise Exception(f"Unknown target: {url}")
+
+            def prepare_filename(self, data):
+                return os.path.join(AUDIO_CACHE_DIR, f"{data.get('id')}.opus")
+
+        # Simulate Innertube returning empty/raising exception -> triggers yt-dlp fallback
+        with patch("engine.discord_bot.async_search_innertube_candidates", AsyncMock(side_effect=Exception("Innertube API timeout"))), \
+             patch("engine.discord_bot.yt_dlp.YoutubeDL", side_effect=FakeYtdl), \
+             patch("engine.discord_bot.os.path.exists", return_value=True):
+            success, msg, is_queued, track = asyncio.run(
+                bot._async_enqueue_or_play("YTDL Fallback Query")
+            )
+            self.assertTrue(success)
+            self.assertEqual(track.get("video_id"), "ytdl_song_1")
+            self.assertEqual(track.get("title"), "YTDL Song 1")
 
     def test_smart_autoplay_excludes_tracks_played_today(self):
         """Verify Smart Autoplay does not replay tracks that were already played today."""
