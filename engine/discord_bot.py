@@ -2794,7 +2794,7 @@ class DiscordVoiceBot:
                         try:
                             ytdl_dl = yt_dlp.YoutubeDL(dl_opts)
                             dl_data = await loop.run_in_executor(
-                                None, lambda: ytdl_dl.extract_info(dl_target, download=True)
+                                None, lambda: ytdl_dl.extract_info(dl_target, download=False)
                             )
                             if dl_data:
                                 data = dl_data
@@ -2815,7 +2815,7 @@ class DiscordVoiceBot:
                                 try:
                                     ytdl_clean = yt_dlp.YoutubeDL(clean_dl_opts)
                                     dl_data = await loop.run_in_executor(
-                                        None, lambda: ytdl_clean.extract_info(dl_target, download=True)
+                                        None, lambda: ytdl_clean.extract_info(dl_target, download=False)
                                     )
                                     if dl_data:
                                         data = dl_data
@@ -2833,7 +2833,7 @@ class DiscordVoiceBot:
                                 try:
                                     ytdl_auth = yt_dlp.YoutubeDL(auth_dl_opts)
                                     dl_data = await loop.run_in_executor(
-                                        None, lambda: ytdl_auth.extract_info(dl_target, download=True)
+                                        None, lambda: ytdl_auth.extract_info(dl_target, download=False)
                                     )
                                     if dl_data:
                                         data = dl_data
@@ -2847,24 +2847,41 @@ class DiscordVoiceBot:
                             else:
                                 logger.info(f"Search candidate {cand_id or dl_target} unavailable ({dl_err}), trying next candidate...")
 
-                    if data and "entries" in data:
-                        entries = [e for e in data["entries"] if e]
-                        if not entries:
-                            return False, f"Track unavailable ({last_error or 'no playable stream'})", False, {}
-                        data = entries[0]
+                    stream_url = None
+                    if data:
+                        if "entries" in data:
+                            entries = [e for e in data["entries"] if e]
+                            if not entries:
+                                return False, f"Track unavailable ({last_error or 'no playable stream'})", False, {}
+                            data = entries[0]
+
+                        stream_url = data.get("url")
+                        if not stream_url and "formats" in data:
+                            audio_formats = [
+                                f for f in data["formats"]
+                                if f.get("url") and (f.get("vcodec") == "none" or "audio" in f.get("format", "").lower() or f.get("acodec") != "none")
+                            ]
+                            if audio_formats:
+                                stream_url = audio_formats[-1].get("url")
+                                if "http_headers" in audio_formats[-1]:
+                                    http_headers = audio_formats[-1].get("http_headers")
 
                     if not data:
                         return False, f"Track unavailable ({last_error or 'not found'})", False, {}
 
-                    prep_ydl = ytdl_active or yt_dlp.YoutubeDL(dl_opts)
-                    filepath = prep_ydl.prepare_filename(data)
-                    if not os.path.exists(filepath):
-                        target_id = data.get("id", "") or res_vid
-                        for fname in os.listdir(cache_dir):
-                            if target_id and fname.startswith(target_id):
-                                filepath = os.path.join(cache_dir, fname)
-                                break
-                    direct_url = filepath
+                    if stream_url:
+                        direct_url = stream_url
+                        filepath = None
+                    else:
+                        prep_ydl = ytdl_active or yt_dlp.YoutubeDL(dl_opts)
+                        filepath = prep_ydl.prepare_filename(data)
+                        if not os.path.exists(filepath):
+                            target_id = data.get("id", "") or res_vid
+                            for fname in os.listdir(cache_dir):
+                                if target_id and fname.startswith(target_id):
+                                    filepath = os.path.join(cache_dir, fname)
+                                    break
+                        direct_url = filepath
 
             if not data:
                 return False, "Track not found.", False, {}
@@ -2912,7 +2929,7 @@ class DiscordVoiceBot:
                 "emoji": emoji,
             }
 
-            # Save metadata and enforce storage limits asynchronously to eliminate event loop lag
+            # Save metadata and enforce storage limits asynchronously if audio file exists
             if target_vid and filepath and os.path.exists(filepath):
                 meta_dict = {
                     "title": title,
@@ -2927,6 +2944,39 @@ class DiscordVoiceBot:
                     prune_audio_cache(cache_dir)
 
                 loop.run_in_executor(None, _bg_persist)
+
+            # If playing via direct stream, trigger background caching so subsequent plays are instant from cache
+            if target_vid and not filepath and direct_url:
+                bg_dl_opts = dict(dl_opts if "dl_opts" in locals() else YTDL_OPTIONS)
+                bg_meta = {
+                    "title": title,
+                    "uploader": uploader,
+                    "duration_sec": sec,
+                    "duration_str": dur_str,
+                    "webpage_url": final_web_url or f"https://www.youtube.com/watch?v={target_vid}",
+                    "video_id": target_vid,
+                }
+                bg_target = final_web_url or f"https://www.youtube.com/watch?v={target_vid}"
+                def _bg_download_to_cache():
+                    try:
+                        save_opts = dict(bg_dl_opts)
+                        save_opts["outtmpl"] = os.path.join(cache_dir, "%(id)s.%(ext)s")
+                        save_opts["noplaylist"] = True
+                        save_opts.pop("extract_flat", None)
+                        if os.path.exists(COOKIE_PATH):
+                            save_opts["cookiefile"] = COOKIE_PATH
+                        else:
+                            save_opts.pop("cookiefile", None)
+                        ydl_bg = yt_dlp.YoutubeDL(save_opts)
+                        bg_info = ydl_bg.extract_info(bg_target, download=True)
+                        if bg_info:
+                            save_track_cache_meta(cache_dir, target_vid, bg_meta)
+                            prune_audio_cache(cache_dir)
+                            logger.info(f"Background cache completed for: '{title}' ({target_vid})")
+                    except Exception as bg_err:
+                        logger.debug(f"Background caching notice for {target_vid}: {bg_err}")
+
+                loop.run_in_executor(None, _bg_download_to_cache)
 
             # Check if playback is currently active
             if self.is_playing or self.is_paused:
