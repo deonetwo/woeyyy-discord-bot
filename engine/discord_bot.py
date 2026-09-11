@@ -19,7 +19,7 @@ import urllib.parse
 import urllib.request
 import warnings
 from datetime import datetime
-from typing import Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
 import discord
