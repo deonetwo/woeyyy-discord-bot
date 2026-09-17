@@ -1405,6 +1405,314 @@ class BufferedAudioSource(discord.AudioSource):
         return getattr(self.original, "_current_error", None) or self._feeder_error
 
 
+def render_progress_bar(elapsed: float, total: float, length: int = 14) -> str:
+    """
+    Render a dynamic Unicode music progress bar.
+    Format: `MM:SS` ▬▬🔘▬▬▬▬ `MM:SS`
+    """
+    def _fmt(sec: float) -> str:
+        s = int(max(0, sec))
+        m, s = divmod(s, 60)
+        h, m = divmod(m, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
+
+    if total <= 0:
+        return f"`{_fmt(elapsed)}` 🔘{'▬' * (length - 1)} `Live`"
+
+    ratio = min(1.0, max(0.0, elapsed / total))
+    pos = int(ratio * (length - 1))
+    bar = "▬" * pos + "🔘" + "▬" * (length - pos - 1)
+    return f"`{_fmt(elapsed)}` {bar} `{_fmt(total)}`"
+
+
+def chunk_lyrics(text: str, max_chunk_size: int = 1800) -> List[str]:
+    """Split lyrics text into readable chunks along line boundaries for Discord Embed pagination."""
+    if not text:
+        return []
+    if len(text) <= max_chunk_size:
+        return [text]
+
+    lines = text.split("\n")
+    chunks = []
+    current_chunk = []
+    current_len = 0
+
+    for line in lines:
+        line_len = len(line) + 1
+        if current_len + line_len > max_chunk_size and current_chunk:
+            chunks.append("\n".join(current_chunk).strip())
+            current_chunk = [line]
+            current_len = line_len
+        else:
+            current_chunk.append(line)
+            current_len += line_len
+
+    if current_chunk:
+        chunks.append("\n".join(current_chunk).strip())
+
+    return chunks
+
+
+async def fetch_lyrics(
+    track_name: str,
+    artist_name: str = "",
+    session: Optional[aiohttp.ClientSession] = None,
+) -> Optional[Dict[str, any]]:
+    """
+    Fetch lyrics from the free, open public LRCLIB REST API.
+    Tries exact track+artist lookup first, then falls back to full-text search.
+    """
+    if not track_name:
+        return None
+
+    clean_title = clean_search_query(track_name)
+    clean_artist = clean_artist_name(artist_name)
+
+    headers = {
+        "User-Agent": "WoeyyyDiscordBot/1.0 (https://github.com/deonetwo/woeyyy-discord-bot)",
+    }
+
+    own_session = False
+    if session is None or session.closed:
+        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=4.0))
+        own_session = True
+
+    try:
+        # 1. Try exact lookup if artist is present
+        if clean_artist and clean_title:
+            params = {
+                "track_name": clean_title,
+                "artist_name": clean_artist,
+            }
+            async with session.get("https://lrclib.net/api/get", params=params, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data and (data.get("plainLyrics") or data.get("syncedLyrics") or data.get("instrumental")):
+                        return data
+
+        # 2. Fallback to /api/search with query
+        query = f"{clean_artist} {clean_title}".strip() if clean_artist else clean_title
+        search_params = {"q": query}
+        async with session.get("https://lrclib.net/api/search", params=search_params, headers=headers) as resp:
+            if resp.status == 200:
+                results = await resp.json()
+                if results and isinstance(results, list):
+                    for candidate in results:
+                        if candidate.get("plainLyrics") or candidate.get("syncedLyrics") or candidate.get("instrumental"):
+                            return candidate
+    except Exception as e:
+        logger.warning(f"Error fetching lyrics from LRCLIB: {e}")
+    finally:
+        if own_session and not session.closed:
+            await session.close()
+
+    return None
+
+
+def build_now_playing_embed(
+    track: Dict[str, any],
+    elapsed: float = 0.0,
+    is_paused: bool = False,
+    volume: float = 1.0,
+    queue: Optional[List[Dict[str, any]]] = None,
+    autoplay: bool = False,
+    smart_autoplay: bool = False,
+) -> discord.Embed:
+    """Build rich Discord Embed with progress bar, artwork thumbnail, and playback stats."""
+    active_track = track or {}
+    title = active_track.get("title", "Unknown Title") or "Unknown Title"
+    url = active_track.get("webpage_url") or active_track.get("url") or ""
+    uploader = clean_artist_name(active_track.get("uploader", "")) or ""
+    duration_sec = active_track.get("duration_sec", 0) or 0
+    vid_id = active_track.get("video_id") or extract_youtube_video_id(url)
+    requester = active_track.get("requester", "Host")
+    is_stream = active_track.get("is_stream", False)
+
+    color = 0xFEE75C if is_paused else 0x5865F2
+    embed = discord.Embed(
+        title=title[:256],
+        url=url if (url.startswith("http://") or url.startswith("https://")) else None,
+        color=color,
+    )
+
+    if uploader:
+        embed.set_author(name=uploader[:256])
+
+    if vid_id:
+        embed.set_thumbnail(url=f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg")
+
+    status_icon = "⏸️" if is_paused else "▶️"
+    status_label = "Paused" if is_paused else "Now Playing"
+    progress = render_progress_bar(elapsed, duration_sec)
+
+    embed.description = f"**{status_icon} {status_label}**\n{progress}"
+
+    vol_pct = int(volume * 100)
+    cache_badge = "⚡ Streamed" if is_stream else "⚡ Cached"
+    audio_info = f"🔊 `{vol_pct}%` • {cache_badge} • 🎧 `48kHz Opus`"
+    embed.add_field(name="Audio Quality", value=audio_info, inline=True)
+    embed.add_field(name="Requested By", value=f"👤 **{requester}**", inline=True)
+
+    # Up Next preview
+    if queue and len(queue) > 0:
+        next_t = queue[0]
+        n_title = next_t.get("title", "Unknown")
+        n_dur = next_t.get("duration_str", "")
+        n_dur_part = f" (`{n_dur}`)" if n_dur else ""
+        next_text = f"**{n_title[:50]}**{n_dur_part}"
+        if len(queue) > 1:
+            next_text += f"\n*(+{len(queue) - 1} more in queue)*"
+        embed.add_field(name="Up Next", value=next_text, inline=False)
+    elif autoplay:
+        auto_mode = "Smart (no repeats today)" if smart_autoplay else "Standard"
+        embed.add_field(name="Up Next", value=f"🔀 *Autoplay active ({auto_mode})*", inline=False)
+    else:
+        embed.add_field(name="Up Next", value="*End of queue*", inline=False)
+
+    embed.set_footer(text="Woeyyy Music Bot • High Quality Opus Audio")
+    return embed
+
+
+class MusicControlView(discord.ui.View):
+    """Interactive Discord playback control buttons (Pause/Resume, Skip, Stop, Queue)."""
+
+    def __init__(self, bot_controller: "DiscordVoiceBot", timeout: Optional[float] = 300.0):
+        super().__init__(timeout=timeout)
+        self.bot = bot_controller
+        self._sync_state()
+
+    def _sync_state(self):
+        if hasattr(self, "btn_play_pause"):
+            if self.bot.is_paused:
+                self.btn_play_pause.emoji = "▶️"
+                self.btn_play_pause.label = "Resume"
+                self.btn_play_pause.style = discord.ButtonStyle.success
+            else:
+                self.btn_play_pause.emoji = "⏸️"
+                self.btn_play_pause.label = "Pause"
+                self.btn_play_pause.style = discord.ButtonStyle.secondary
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        bot_vc = self.bot.voice_client
+        if not bot_vc or not bot_vc.channel:
+            await interaction.response.send_message("Bot is not currently in a voice channel.", ephemeral=True)
+            return False
+        user_voice = getattr(interaction.user, "voice", None)
+        user_channel = getattr(user_voice, "channel", None) if user_voice else None
+        if not user_channel or user_channel.id != bot_vc.channel.id:
+            await interaction.response.send_message(
+                "You must be in the same voice channel as the bot to use playback controls.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(emoji="⏸️", label="Pause", style=discord.ButtonStyle.secondary, custom_id="woeyyy_music_play_pause")
+    async def btn_play_pause(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.bot.is_paused:
+            self.bot.resume()
+        elif self.bot.voice_client and self.bot.voice_client.is_playing():
+            self.bot.pause()
+        self._sync_state()
+        new_embed = self.bot.build_now_playing_embed()
+        if not interaction.response.is_done():
+            await interaction.response.edit_message(embed=new_embed, view=self)
+        elif interaction.message:
+            await interaction.message.edit(embed=new_embed, view=self)
+
+    @discord.ui.button(emoji="⏭️", label="Skip", style=discord.ButtonStyle.secondary, custom_id="woeyyy_music_skip")
+    async def btn_skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        old_title = self.bot.skip()
+        skipped_name = old_title or "current track"
+        await interaction.response.send_message(f"⏭️ Skipped **{skipped_name}**.", ephemeral=True)
+
+    @discord.ui.button(emoji="⏹️", label="Stop", style=discord.ButtonStyle.danger, custom_id="woeyyy_music_stop")
+    async def btn_stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.bot.stop_playback()
+        for item in self.children:
+            item.disabled = True
+        if not interaction.response.is_done():
+            await interaction.response.edit_message(content="⏹️ Playback stopped and queue cleared.", embed=None, view=self)
+        elif interaction.message:
+            await interaction.message.edit(content="⏹️ Playback stopped and queue cleared.", embed=None, view=self)
+
+    @discord.ui.button(emoji="📜", label="Queue", style=discord.ButtonStyle.secondary, custom_id="woeyyy_music_queue")
+    async def btn_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.bot.current_track and not self.bot.queue:
+            await interaction.response.send_message("The queue is empty.", ephemeral=True)
+            return
+
+        lines = []
+        if self.bot.current_track:
+            c_title = self.bot.current_track.get("title", "Unknown")
+            c_dur = self.bot.current_track.get("duration_str", "Live")
+            c_up = self.bot.current_track.get("uploader", "")
+            up_part = f" by **{c_up}**" if c_up else ""
+            lines.append(f"**Now Playing:** {c_title}{up_part} (`{c_dur}`)")
+
+        if self.bot.queue:
+            lines.append(f"\n**Upcoming Queue ({len(self.bot.queue)} tracks):**")
+            for i, t in enumerate(self.bot.queue[:10], start=1):
+                t_title = t.get("title", "Unknown")
+                t_dur = t.get("duration_str", "Live")
+                t_up = t.get("uploader", "")
+                up_part = f" by **{t_up}**" if t_up else ""
+                dur_part = f" (`{t_dur}`)" if t_dur else ""
+                lines.append(f"`{i}.` **{t_title}**{up_part}{dur_part}")
+            if len(self.bot.queue) > 10:
+                lines.append(f"... and {len(self.bot.queue) - 10} more tracks.")
+        else:
+            lines.append("\n*No more tracks queued.*")
+
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+class LyricsPaginationView(discord.ui.View):
+    """Pagination controls for multi-page lyrics embeds."""
+
+    def __init__(
+        self,
+        pages: List[discord.Embed],
+        author_id: int,
+        timeout: float = 180.0,
+    ):
+        super().__init__(timeout=timeout)
+        self.pages = pages
+        self.author_id = author_id
+        self.current_page = 0
+        self._update_buttons()
+
+    def _update_buttons(self):
+        self.btn_prev.disabled = (self.current_page == 0)
+        self.btn_next.disabled = (self.current_page >= len(self.pages) - 1)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Only the user who requested the lyrics can control pagination.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(emoji="◀️", label="Prev", style=discord.ButtonStyle.secondary)
+    async def btn_prev(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self._update_buttons()
+            await interaction.response.edit_message(embed=self.pages[self.current_page], view=self)
+
+    @discord.ui.button(emoji="▶️", label="Next", style=discord.ButtonStyle.secondary)
+    async def btn_next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page < len(self.pages) - 1:
+            self.current_page += 1
+            self._update_buttons()
+            await interaction.response.edit_message(embed=self.pages[self.current_page], view=self)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+
+
 class DiscordVoiceBot:
     """
     Thread-safe Discord bot controller with queue and slash commands.
@@ -1466,6 +1774,44 @@ class DiscordVoiceBot:
         self._manual_stop: bool = False
         self._manual_skip: bool = False
         self.last_text_channel: Optional[discord.abc.Messageable] = None
+
+        # Playback timing attributes for progress bar and elapsed tracking
+        self.track_start_time: float = 0.0
+        self.paused_duration: float = 0.0
+        self.pause_start_time: Optional[float] = None
+        self.last_np_message: Optional[discord.Message] = None
+
+    def get_track_elapsed_seconds(self) -> float:
+        """Calculate exact playback elapsed seconds taking pauses into account."""
+        if not self.is_playing and not self.is_paused:
+            return 0.0
+        if self.track_start_time <= 0:
+            return 0.0
+        now = time.time()
+        current_pause = (now - self.pause_start_time) if (self.is_paused and self.pause_start_time) else 0.0
+        elapsed = now - self.track_start_time - self.paused_duration - current_pause
+        duration = (self.current_track.get("duration_sec", 0) or 0) if self.current_track else 0
+        if duration > 0:
+            return min(float(duration), max(0.0, elapsed))
+        return max(0.0, elapsed)
+
+    def build_now_playing_embed(
+        self,
+        track: Optional[Dict[str, any]] = None,
+        elapsed: Optional[float] = None,
+    ) -> discord.Embed:
+        """Build rich Discord Embed for the currently playing track."""
+        active_track = track or self.current_track or {}
+        cur_elapsed = elapsed if elapsed is not None else self.get_track_elapsed_seconds()
+        return build_now_playing_embed(
+            track=active_track,
+            elapsed=cur_elapsed,
+            is_paused=self.is_paused,
+            volume=self.volume,
+            queue=self.queue,
+            autoplay=self.autoplay,
+            smart_autoplay=self.smart_autoplay,
+        )
 
     def _bind_text_channel(
         self,
@@ -1830,10 +2176,15 @@ class DiscordVoiceBot:
                 if is_queued:
                     pos = len(self.queue)
                     msg_text = f"{prefix}Added {link_part}{uploader_part}{dur_part} to the queue at position #{pos}."
+                    await msg_handle.edit(content=msg_text)
                 else:
                     msg_text = f"{prefix}Added {link_part}{uploader_part}{dur_part} to begin playing."
-
-                await msg_handle.edit(content=msg_text)
+                    try:
+                        view = MusicControlView(self)
+                        await msg_handle.edit(content=msg_text, view=view)
+                        self.last_np_message = msg_handle
+                    except Exception:
+                        await msg_handle.edit(content=msg_text)
             except Exception as e:
                 logger.error(f"Error during /play command execution: {e}")
                 try:
@@ -2047,6 +2398,115 @@ class DiscordVoiceBot:
             emoji = get_random_server_emoji(interaction.guild)
             prefix = f"{emoji} " if emoji else ""
             await interaction.response.send_message(f"{prefix}Playback stopped{cur_link} and queue cleared.", suppress_embeds=True)
+
+        async def _execute_now_playing(interaction: discord.Interaction):
+            is_active = (
+                (self.voice_client and (self.voice_client.is_playing() or self.voice_client.is_paused()))
+                or self.is_playing
+                or bool(self.current_track)
+            )
+            if not is_active or not self.current_track:
+                await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
+                return
+
+            embed = self.build_now_playing_embed()
+            view = MusicControlView(self)
+            await interaction.response.send_message(embed=embed, view=view)
+            try:
+                msg = await interaction.original_response()
+                self.last_np_message = msg
+            except Exception:
+                pass
+
+        @bot.tree.command(
+            name="nowplaying",
+            description="Display the currently playing song with interactive playback controls",
+        )
+        async def cmd_nowplaying(interaction: discord.Interaction):
+            await _execute_now_playing(interaction)
+
+        @bot.tree.command(name="np", description="Shortcut for /nowplaying")
+        async def cmd_np(interaction: discord.Interaction):
+            await _execute_now_playing(interaction)
+
+        @bot.tree.command(
+            name="lyrics",
+            description="Search lyrics for the currently playing track or a specific song",
+        )
+        @app_commands.describe(song="Song title or search query (leave blank for currently playing song)")
+        async def cmd_lyrics(interaction: discord.Interaction, song: Optional[str] = None):
+            await interaction.response.defer(ephemeral=False)
+
+            query_title = song
+            artist = ""
+            thumbnail_url = None
+
+            if not query_title:
+                if not self.current_track:
+                    await interaction.followup.send(
+                        "No song is currently playing. Please specify a song title (e.g. `/lyrics Bohemian Rhapsody`).",
+                        ephemeral=True,
+                    )
+                    return
+                query_title = self.current_track.get("title", "")
+                artist = self.current_track.get("uploader", "")
+                vid_id = self.current_track.get("video_id") or extract_youtube_video_id(self.current_track.get("webpage_url", ""))
+                if vid_id:
+                    thumbnail_url = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg"
+
+            session = await self._get_http_session()
+            lyrics_data = await fetch_lyrics(query_title, artist_name=artist, session=session)
+
+            if not lyrics_data or (not lyrics_data.get("plainLyrics") and not lyrics_data.get("instrumental")):
+                emoji = get_random_server_emoji(interaction.guild)
+                prefix = f"{emoji} " if emoji else ""
+                await interaction.followup.send(f"{prefix}No lyrics found for **{query_title}**.")
+                return
+
+            if lyrics_data.get("instrumental"):
+                disp_title = lyrics_data.get("trackName") or query_title
+                embed = discord.Embed(
+                    title=f"🎶 {disp_title[:200]}",
+                    description="*This track is an instrumental (no lyrics).*",
+                    color=0x5865F2,
+                )
+                disp_artist = lyrics_data.get("artistName") or artist
+                if disp_artist:
+                    embed.set_author(name=disp_artist[:256])
+                if thumbnail_url:
+                    embed.set_thumbnail(url=thumbnail_url)
+                embed.set_footer(text="Lyrics provided by LRCLIB")
+                await interaction.followup.send(embed=embed)
+                return
+
+            plain_text = lyrics_data.get("plainLyrics") or ""
+            display_title = lyrics_data.get("trackName") or query_title
+            display_artist = lyrics_data.get("artistName") or artist
+            chunks = chunk_lyrics(plain_text, max_chunk_size=1800)
+
+            pages = []
+            total_pages = len(chunks)
+            for idx, chunk in enumerate(chunks, start=1):
+                embed = discord.Embed(
+                    title=f"📜 Lyrics: {display_title[:200]}",
+                    description=chunk,
+                    color=0x5865F2,
+                )
+                if display_artist:
+                    embed.set_author(name=display_artist[:256])
+                if thumbnail_url:
+                    embed.set_thumbnail(url=thumbnail_url)
+                if total_pages > 1:
+                    embed.set_footer(text=f"Page {idx} of {total_pages} • Lyrics provided by LRCLIB")
+                else:
+                    embed.set_footer(text="Lyrics provided by LRCLIB")
+                pages.append(embed)
+
+            if len(pages) == 1:
+                await interaction.followup.send(embed=pages[0])
+            else:
+                view = LyricsPaginationView(pages, author_id=interaction.user.id)
+                await interaction.followup.send(embed=pages[0], view=view)
 
         @bot.tree.command(name="volume", description="Adjust playback volume (0% - 150%)")
         @app_commands.describe(percentage="Volume percentage (e.g. 100)")
@@ -2440,6 +2900,10 @@ class DiscordVoiceBot:
         self.voice_client = None
         self.queue.clear()
         self.current_track = None
+        self.track_start_time = 0.0
+        self.paused_duration = 0.0
+        self.pause_start_time = None
+        self.last_np_message = None
         self._notify_status("OFFLINE", "Bot disconnected")
 
     def _refresh_voice_channels_internal(self):
@@ -2515,6 +2979,10 @@ class DiscordVoiceBot:
             self._idle_since = None
             self.queue.clear()
             self.current_track = None
+            self.track_start_time = 0.0
+            self.paused_duration = 0.0
+            self.pause_start_time = None
+            self.last_np_message = None
             self._notify_status("VOICE_DISCONNECTED", "Left voice channel")
             self._notify_status("QUEUE_UPDATED", "")
 
@@ -3278,6 +3746,11 @@ class DiscordVoiceBot:
             except Exception:
                 pass
 
+            # Reset playback timing for accurate progress bar calculations
+            self.track_start_time = time.time()
+            self.paused_duration = 0.0
+            self.pause_start_time = None
+
             self.voice_client.play(transformer, after=_after_play)
             self.is_playing = True
             self.is_paused = False
@@ -3297,16 +3770,23 @@ class DiscordVoiceBot:
                 target_channel = self._get_announce_channel()
                 if target_channel and hasattr(target_channel, "send"):
                     try:
+                        # Clean up buttons from previous now playing message to prevent stale button interactions
+                        if self.last_np_message:
+                            try:
+                                await self.last_np_message.edit(view=None)
+                            except Exception:
+                                pass
                         link_part = format_song_link(title, track.get("webpage_url", ""))
                         up_part = f" by **{uploader}**" if uploader else ""
                         dur = track.get("duration_str", "")
                         dur_part = f" (`{dur}`)" if dur else ""
                         prefix = f"{emoji} " if emoji else ""
                         msg = f"{prefix}Now playing {link_part}{up_part}{dur_part}."
-                        try:
-                            await target_channel.send(msg, suppress_embeds=True)
-                        except TypeError:
-                            await target_channel.send(msg)
+
+                        np_embed = self.build_now_playing_embed(track, elapsed=0.0)
+                        view = MusicControlView(self)
+                        sent_msg = await target_channel.send(msg, embed=np_embed, view=view)
+                        self.last_np_message = sent_msg
                     except Exception as send_err:
                         logger.warning(f"Could not send now playing announcement to text channel: {send_err}")
         except discord.opus.OpusNotLoaded:
@@ -3411,6 +3891,8 @@ class DiscordVoiceBot:
         if self.voice_client and self.voice_client.is_playing():
             self.voice_client.pause()
             self.is_paused = True
+            if self.pause_start_time is None:
+                self.pause_start_time = time.time()
             self._notify_status("PAUSED", self.current_title)
             if self._loop and self._loop.is_running():
                 title = self.current_track.get("title", self.current_title) if self.current_track else self.current_title
@@ -3423,6 +3905,9 @@ class DiscordVoiceBot:
         if self.voice_client and self.voice_client.is_paused():
             self.voice_client.resume()
             self.is_paused = False
+            if self.pause_start_time is not None:
+                self.paused_duration += (time.time() - self.pause_start_time)
+                self.pause_start_time = None
             self._notify_status("PLAYING", self.current_title)
             if self._loop and self._loop.is_running():
                 emoji = (self.current_track.get("emoji") if self.current_track else None) or get_random_server_emoji(self.voice_client.guild if self.voice_client else None)
@@ -3440,6 +3925,10 @@ class DiscordVoiceBot:
             self.voice_client.stop()
         self.is_playing = False
         self.is_paused = False
+        self.track_start_time = 0.0
+        self.paused_duration = 0.0
+        self.pause_start_time = None
+        self.last_np_message = None
         self.current_title = "No audio playing"
         self._idle_since = time.time()
         self._notify_status("PLAYBACK_STOPPED", "")

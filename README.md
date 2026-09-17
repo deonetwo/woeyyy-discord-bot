@@ -11,6 +11,9 @@ The project is completely headless, with no GUI dependencies or local audio devi
 ## Features
 
 - **Direct Voice Streaming**: Plays 48kHz stereo Opus audio directly into Discord voice channels.
+- **Interactive Playback Controls**: Real-time Discord UI buttons (`⏯️ Pause/Resume`, `⏭️ Skip`, `⏹️ Stop`, `📜 Queue`) attached to the now-playing message with voice channel authorization.
+- **Rich Now Playing Embed & Progress Bar**: Dynamic Unicode progress bar (`01:24 ▬▬🔘▬▬▬▬ 05:05`), YouTube cover art, audio quality tags (`48kHz Opus`), requester badges, and up-next preview via `/nowplaying` or `/np`.
+- **Zero-Config Lyrics Integration**: Free, instant lyrics retrieval powered by [LRCLIB](https://lrclib.net/) with interactive verse pagination (`/lyrics`).
 - **YouTube and YouTube Music**: Supports search queries, regular YouTube links, and `music.youtube.com` URL normalization.
 - **Voice Channel Status**: Dynamically displays the currently playing track and emoji under the voice channel name.
 - **Instant Cache Bypass & LRU Storage**: Repeated songs and cached tracks start playing instantly (<10ms) while an automatic LRU cleaner keeps storage capped (`MAX_CACHE_MB=500`, `MAX_CACHE_FILES=50`).
@@ -28,6 +31,8 @@ The project is completely headless, with no GUI dependencies or local audio devi
 |---|---|
 | `/join` | Connect bot to your voice channel |
 | `/play <query/url>` | Play audio or add to queue (supports history autocomplete) |
+| `/nowplaying`, `/np` | Display rich embed with dynamic progress bar and interactive playback controls |
+| `/lyrics [song]` | View lyrics for currently playing track or search any song title |
 | `/skip` | Skip the currently playing track |
 | `/pause` | Pause playback |
 | `/resume` | Resume playback |

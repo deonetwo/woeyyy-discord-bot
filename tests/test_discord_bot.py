@@ -1555,6 +1555,211 @@ class TestDiscordVoiceBot(unittest.TestCase):
             # In standard mode, track must not be recorded into daily smart history
             self.assertNotIn("repeatable_vid", bot._get_autoplay_played_ids_today())
 
+    def test_render_progress_bar(self):
+        """Verify dynamic progress bar formatting across 0%, 50%, 100%, live, and long durations."""
+        from engine.discord_bot import render_progress_bar
+
+        # 0%
+        bar_0 = render_progress_bar(0, 100, length=10)
+        self.assertIn("00:00", bar_0)
+        self.assertIn("01:40", bar_0)
+        self.assertIn("🔘▬▬▬▬▬▬▬▬▬", bar_0)
+
+        # 50%
+        bar_50 = render_progress_bar(50, 100, length=10)
+        self.assertIn("00:50", bar_50)
+        self.assertIn("01:40", bar_50)
+        self.assertIn("🔘", bar_50)
+
+        # 100%
+        bar_100 = render_progress_bar(100, 100, length=10)
+        self.assertIn("01:40", bar_100)
+        self.assertTrue(bar_100.endswith("`01:40`"))
+
+        # Live stream (total = 0)
+        bar_live = render_progress_bar(35, 0, length=10)
+        self.assertIn("00:35", bar_live)
+        self.assertIn("Live", bar_live)
+
+        # Hours formatting (>3600s)
+        bar_hours = render_progress_bar(3665, 7200, length=10)
+        self.assertIn("01:01:05", bar_hours)
+        self.assertIn("02:00:00", bar_hours)
+
+    def test_get_track_elapsed_seconds_and_pausing(self):
+        """Verify elapsed time calculation during active playback, pause, and resume states."""
+        bot = DiscordVoiceBot()
+        bot.is_playing = True
+        bot.current_track = {"duration_sec": 300}
+        base_time = 1000.0
+
+        with patch("engine.discord_bot.time.time") as mock_time:
+            # 1. Start playback
+            mock_time.return_value = base_time
+            bot.track_start_time = base_time
+            bot.paused_duration = 0.0
+            bot.pause_start_time = None
+
+            # 10 seconds later
+            mock_time.return_value = base_time + 10.0
+            self.assertAlmostEqual(bot.get_track_elapsed_seconds(), 10.0, places=1)
+
+            # 2. Pause playback
+            bot.pause_start_time = base_time + 10.0
+            bot.is_paused = True
+
+            # 5 seconds pass while paused -> elapsed should still be 10.0
+            mock_time.return_value = base_time + 15.0
+            self.assertAlmostEqual(bot.get_track_elapsed_seconds(), 10.0, places=1)
+
+            # 3. Resume playback
+            bot.paused_duration += (mock_time.return_value - bot.pause_start_time)
+            bot.pause_start_time = None
+            bot.is_paused = False
+
+            # 5 more seconds pass after resuming -> elapsed should be 15.0
+            mock_time.return_value = base_time + 20.0
+            self.assertAlmostEqual(bot.get_track_elapsed_seconds(), 15.0, places=1)
+
+    def test_build_now_playing_embed(self):
+        """Verify build_now_playing_embed creates rich embed with metadata and progress bar."""
+        from engine.discord_bot import build_now_playing_embed
+
+        sample_track = {
+            "title": "Hidamari",
+            "webpage_url": "https://www.youtube.com/watch?v=hidamari123",
+            "uploader": "Ms.OOJA - Topic",
+            "duration_sec": 245,
+            "duration_str": "4:05",
+            "video_id": "hidamari123",
+            "requester": "Rayhan",
+            "is_stream": False,
+        }
+
+        embed = build_now_playing_embed(
+            track=sample_track,
+            elapsed=60.0,
+            is_paused=False,
+            volume=1.0,
+            queue=[{"title": "Next Song", "duration_str": "3:30"}],
+        )
+
+        self.assertEqual(embed.title, "Hidamari")
+        self.assertEqual(embed.url, "https://www.youtube.com/watch?v=hidamari123")
+        self.assertEqual(embed.author.name, "Ms.OOJA")
+        self.assertIn("https://img.youtube.com/vi/hidamari123/mqdefault.jpg", embed.thumbnail.url)
+        self.assertIn("▶️ Now Playing", embed.description)
+        self.assertIn("🔘", embed.description)
+
+        field_names = [f.name for f in embed.fields]
+        self.assertIn("Audio Quality", field_names)
+        self.assertIn("Requested By", field_names)
+        self.assertIn("Up Next", field_names)
+
+        up_next_field = next(f for f in embed.fields if f.name == "Up Next")
+        self.assertIn("Next Song", up_next_field.value)
+
+    def test_chunk_lyrics(self):
+        """Verify chunk_lyrics cleanly splits multi-verse lyrics into bounded chunks."""
+        from engine.discord_bot import chunk_lyrics
+
+        self.assertEqual(chunk_lyrics(""), [])
+
+        short_text = "Line 1\nLine 2\nLine 3"
+        chunks = chunk_lyrics(short_text, max_chunk_size=50)
+        self.assertEqual(chunks, [short_text])
+
+        lines = [f"This is line {i} of an extensive song lyric with lots of verse content." for i in range(50)]
+        long_lyrics = "\n".join(lines)
+        chunks_split = chunk_lyrics(long_lyrics, max_chunk_size=300)
+        self.assertGreater(len(chunks_split), 1)
+        for chunk in chunks_split:
+            self.assertLessEqual(len(chunk), 300)
+
+    def test_fetch_lyrics_mock(self):
+        """Verify fetch_lyrics makes HTTP calls to LRCLIB and returns parsed data."""
+        import asyncio
+        from engine.discord_bot import fetch_lyrics
+
+        mock_session = MagicMock()
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={
+            "trackName": "Hidamari",
+            "artistName": "Ms.OOJA",
+            "plainLyrics": "Kimi ga iru kara...",
+            "syncedLyrics": "[00:10.00] Kimi ga iru kara...",
+        })
+        mock_resp.__aenter__.return_value = mock_resp
+        mock_resp.__aexit__.return_value = None
+        mock_session.get.return_value = mock_resp
+        mock_session.closed = False
+
+        res = asyncio.run(fetch_lyrics("Hidamari", artist_name="Ms.OOJA", session=mock_session))
+        self.assertIsNotNone(res)
+        self.assertEqual(res["plainLyrics"], "Kimi ga iru kara...")
+
+    def test_music_control_view_and_lyrics_view(self):
+        """Verify MusicControlView and LyricsPaginationView state initialization and button states."""
+        from engine.discord_bot import LyricsPaginationView, MusicControlView
+        import discord
+
+        bot = DiscordVoiceBot()
+        bot.is_paused = False
+        view = MusicControlView(bot)
+        self.assertEqual(view.btn_play_pause.label, "Pause")
+
+        bot.is_paused = True
+        view._sync_state()
+        self.assertEqual(view.btn_play_pause.label, "Resume")
+
+        # Test LyricsPaginationView
+        embed1 = discord.Embed(title="Page 1")
+        embed2 = discord.Embed(title="Page 2")
+        lyrics_view = LyricsPaginationView(pages=[embed1, embed2], author_id=12345)
+        self.assertTrue(lyrics_view.btn_prev.disabled)
+        self.assertFalse(lyrics_view.btn_next.disabled)
+
+    def test_tree_commands_registered(self):
+        """Verify nowplaying, np, and lyrics slash commands are present in command tree."""
+        import discord
+        from discord.ext import commands
+
+        bot = DiscordVoiceBot()
+        intents = discord.Intents.default()
+        bot.client = commands.Bot(command_prefix="!", intents=intents)
+        bot._register_slash_commands()
+
+        commands_map = {cmd.name: cmd for cmd in bot.client.tree.get_commands()}
+        self.assertIn("nowplaying", commands_map)
+        self.assertIn("np", commands_map)
+        self.assertIn("lyrics", commands_map)
+
+        # Verify executing /nowplaying and /np callbacks does not raise TypeError ('Command' object is not callable)
+        mock_interaction = MagicMock()
+        mock_interaction.response.send_message = AsyncMock()
+        mock_interaction.original_response = AsyncMock(return_value=MagicMock())
+
+        # Test when nothing is playing
+        bot.is_playing = False
+        bot.current_track = None
+        asyncio.run(commands_map["nowplaying"].callback(mock_interaction))
+        mock_interaction.response.send_message.assert_called_with("Nothing is currently playing.", ephemeral=True)
+
+        mock_interaction.response.send_message.reset_mock()
+        asyncio.run(commands_map["np"].callback(mock_interaction))
+        mock_interaction.response.send_message.assert_called_with("Nothing is currently playing.", ephemeral=True)
+
+        # Test when playing
+        bot.is_playing = True
+        bot.current_track = {"title": "Active Track", "duration_sec": 120}
+        mock_interaction.response.send_message.reset_mock()
+        asyncio.run(commands_map["np"].callback(mock_interaction))
+        mock_interaction.response.send_message.assert_called_once()
+        np_call_kwargs = mock_interaction.response.send_message.call_args[1]
+        self.assertIn("embed", np_call_kwargs)
+        self.assertIn("view", np_call_kwargs)
+
 
 if __name__ == "__main__":
     unittest.main()
