@@ -1561,7 +1561,7 @@ class DiscordVoiceBot:
             return set(self._autoplay_played_ids)
 
     def record_autoplay_track(self, vid_id: Optional[str]):
-        """Record track ID as played today by smart autoplay."""
+        """Record track ID as played today (used by Smart Autoplay to prevent duplicate plays)."""
         if not vid_id:
             return
         today = get_today_date_str()
@@ -2647,6 +2647,9 @@ class DiscordVoiceBot:
                     "emoji": emoji,
                 }
 
+                if target_vid:
+                    self.record_autoplay_track(target_vid)
+
                 if self.is_playing or self.is_paused:
                     self.queue.append(track)
                     self._notify_status("ENQUEUED", track["title"])
@@ -2956,6 +2959,9 @@ class DiscordVoiceBot:
                 "emoji": emoji,
             }
 
+            if target_vid:
+                self.record_autoplay_track(target_vid)
+
             # Save metadata and enforce storage limits asynchronously to eliminate event loop lag
             if target_vid and filepath and os.path.exists(filepath):
                 meta_dict = {
@@ -3001,6 +3007,16 @@ class DiscordVoiceBot:
             ensure_track_title(track)
             self.current_track = track
             self.current_title = track["title"]
+
+            # Record track ID to daily played history so Smart Autoplay does not duplicate played tracks today
+            track_vid = (
+                track.get("video_id")
+                or extract_youtube_video_id(track.get("webpage_url", ""))
+                or extract_youtube_video_id(track.get("url", ""))
+                or (os.path.splitext(os.path.basename(track.get("filepath", "")))[0] if track.get("filepath") else "")
+            )
+            if track_vid:
+                self.record_autoplay_track(track_vid)
 
             ffmpeg_bin = get_ffmpeg_binary()
             audio_src = track.get("filepath") or track.get("url")
@@ -3160,6 +3176,7 @@ class DiscordVoiceBot:
                                         track["is_stream"] = False
                                         fb_vid = fallback_data.get("id") or extract_youtube_video_id(track.get("webpage_url", ""))
                                         if fb_vid:
+                                            self.record_autoplay_track(fb_vid)
                                             fb_meta = {
                                                 "title": track.get("title", fb_vid),
                                                 "uploader": track.get("uploader", ""),

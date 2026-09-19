@@ -1363,6 +1363,42 @@ class TestDiscordVoiceBot(unittest.TestCase):
             res_none = index.get_random_track(tmpdir, exclude_vid_ids=played_all)
             self.assertIsNone(res_none, "Smart autoplay must not repeat any song once all songs played today")
 
+    def test_user_played_song_recorded_in_daily_autoplay_history(self):
+        """Verify songs played or enqueued by users are recorded into daily played history so Smart Autoplay does not replay them."""
+        import tempfile
+        from engine.discord_bot import DiscordVoiceBot, AudioCacheIndex
+
+        bot = DiscordVoiceBot()
+        bot.clear_autoplay_history()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            song_vid = "testvid1234"
+            song_file = os.path.join(tmpdir, f"{song_vid}.opus")
+            meta_file = os.path.join(tmpdir, f"{song_vid}.json")
+            with open(song_file, "wb") as f:
+                f.write(b"0" * 2048)
+            with open(meta_file, "w", encoding="utf-8") as f:
+                json.dump({"title": "User Favorite Song", "video_id": song_vid, "duration_sec": 180}, f)
+
+            test_index = AudioCacheIndex()
+            test_index.put(tmpdir, song_vid, {"title": "User Favorite Song", "video_id": song_vid}, song_file)
+
+            # 1. Simulate playing the cached track
+            with patch("engine.discord_bot.AUDIO_CACHE_DIR", tmpdir), \
+                 patch.object(bot, "_ensure_voice_connected", new=AsyncMock()), \
+                 patch.object(bot, "_async_play_track", new=AsyncMock()):
+                asyncio.run(bot._async_enqueue_or_play(f"https://www.youtube.com/watch?v={song_vid}", requester="UserAlice"))
+
+            # Verify that song_vid was added to today's played history
+            played_today = bot._get_autoplay_played_ids_today()
+            self.assertIn(song_vid, played_today, "User played song must be added to daily played history")
+
+            # 2. Smart Autoplay must now exclude this track
+            res = test_index.get_random_track(tmpdir, exclude_vid_ids=played_today)
+            self.assertIsNone(res, "Smart autoplay must not pick the user played song since all songs in cache were played today")
+
+            bot.clear_autoplay_history()
+
     def test_smart_autoplay_date_rollover_and_persistence(self):
         """Verify Smart Autoplay state rolls over when date changes and persists to disk."""
         import tempfile
