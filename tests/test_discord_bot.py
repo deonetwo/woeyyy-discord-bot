@@ -1050,7 +1050,7 @@ class TestDiscordVoiceBot(unittest.TestCase):
         asyncio.run(commands_map["pause"].callback(mock_interaction))
         mock_interaction.response.send_message.assert_called_once()
         pause_content = mock_interaction.response.send_message.call_args[0][0]
-        self.assertIn("**[Link Song](<https://www.youtube.com/watch?v=linksong123>)**", pause_content)
+        self.assertIn("**[Link Song](https://www.youtube.com/watch?v=linksong123)**", pause_content)
 
         # Test cmd_resume
         bot.voice_client.is_paused.return_value = True
@@ -1058,7 +1058,7 @@ class TestDiscordVoiceBot(unittest.TestCase):
         asyncio.run(commands_map["resume"].callback(mock_interaction))
         mock_interaction.response.send_message.assert_called_once()
         resume_content = mock_interaction.response.send_message.call_args[0][0]
-        self.assertIn("**[Link Song](<https://www.youtube.com/watch?v=linksong123>)**", resume_content)
+        self.assertIn("**[Link Song](https://www.youtube.com/watch?v=linksong123)**", resume_content)
 
         # Test cmd_skip
         bot.is_playing = True
@@ -1066,7 +1066,7 @@ class TestDiscordVoiceBot(unittest.TestCase):
         asyncio.run(commands_map["skip"].callback(mock_interaction))
         mock_interaction.response.send_message.assert_called_once()
         skip_content = mock_interaction.response.send_message.call_args[0][0]
-        self.assertIn("**[Link Song](<https://www.youtube.com/watch?v=linksong123>)**", skip_content)
+        self.assertIn("**[Link Song](https://www.youtube.com/watch?v=linksong123)**", skip_content)
 
     def test_skip_advances_queue_and_sets_manual_skip(self):
         """Verify skip sets _manual_skip and advances queue cleanly."""
@@ -1103,19 +1103,25 @@ class TestDiscordVoiceBot(unittest.TestCase):
         # Standard YouTube URL
         self.assertEqual(
             format_song_link("The Rare Occasions - Notion", "https://www.youtube.com/watch?v=PD1EXJScA6k"),
-            "**[The Rare Occasions - Notion](<https://www.youtube.com/watch?v=PD1EXJScA6k>)**",
+            "**[The Rare Occasions - Notion](https://www.youtube.com/watch?v=PD1EXJScA6k)**",
         )
 
         # YouTube URL with search/share params (&pp=...)
         self.assertEqual(
             format_song_link("Notion", "https://www.youtube.com/watch?v=PD1EXJScA6k&pp=ygUbVGhlIFJhcmUgT2NjYXNpb25zIC0gTm90aW9u"),
-            "**[Notion](<https://www.youtube.com/watch?v=PD1EXJScA6k&pp=ygUbVGhlIFJhcmUgT2NjYXNpb25zIC0gTm90aW9u>)**",
+            "**[Notion](https://www.youtube.com/watch?v=PD1EXJScA6k&pp=ygUbVGhlIFJhcmUgT2NjYXNpb25zIC0gTm90aW9u)**",
         )
 
         # Raw 11-char video ID string
         self.assertEqual(
             format_song_link("Notion", "PD1EXJScA6k"),
-            "**[Notion](<https://www.youtube.com/watch?v=PD1EXJScA6k>)**",
+            "**[Notion](https://www.youtube.com/watch?v=PD1EXJScA6k)**",
+        )
+
+        # Title with square brackets (must convert to parentheses to protect markdown link syntax)
+        self.assertEqual(
+            format_song_link("Tame Impala - Loser [Official Video]", "https://www.youtube.com/watch?v=LGLS4ARe-vw"),
+            "**[Tame Impala - Loser (Official Video)](https://www.youtube.com/watch?v=LGLS4ARe-vw)**",
         )
 
         # Plain search query (not an HTTP URL or video ID)
@@ -1191,8 +1197,8 @@ class TestDiscordVoiceBot(unittest.TestCase):
             mock_interaction.response.send_message.assert_called_once()
             msg_content = mock_interaction.response.send_message.call_args[0][0]
 
-            self.assertIn("Skipped **[Current Song](<https://www.youtube.com/watch?v=curr123>)**", msg_content)
-            self.assertIn("Now playing **[Autoplay Song](<https://www.youtube.com/watch?v=testvid123>)**", msg_content)
+            self.assertIn("Skipped **[Current Song](https://www.youtube.com/watch?v=curr123)**", msg_content)
+            self.assertIn("Now playing **[Autoplay Song](https://www.youtube.com/watch?v=testvid123)**", msg_content)
             self.assertIn("by **Test Artist**", msg_content)
             self.assertIn("(`3:30`)", msg_content)
 
@@ -1264,7 +1270,7 @@ class TestDiscordVoiceBot(unittest.TestCase):
 
             mock_channel.send.assert_awaited_once()
             sent_msg = mock_channel.send.call_args[0][0]
-            self.assertIn("Now playing **[Next Random Song](<https://www.youtube.com/watch?v=next_rand_vid>)**", sent_msg)
+            self.assertIn("Now playing **[Next Random Song](https://www.youtube.com/watch?v=next_rand_vid)**", sent_msg)
             self.assertIn("by **Random Artist**", sent_msg)
             self.assertIn("(`4:00`)", sent_msg)
 

@@ -498,13 +498,15 @@ def extract_youtube_video_id(url_or_query: str) -> Optional[str]:
 def format_song_link(title: str, url: str) -> str:
     """Format song title as a clickable Discord markdown link if a valid HTTP(S) URL is present."""
     t = (title or "").strip() or "Song"
+    # Replace inner square brackets with parentheses so Discord markdown [text](url) syntax is never broken
+    t = t.replace("[", "(").replace("]", ")")
     u = (url or "").strip()
     if not (u.startswith("http://") or u.startswith("https://")):
         vid = extract_youtube_video_id(u)
         if vid:
             u = f"https://www.youtube.com/watch?v={vid}"
     if u and (u.startswith("http://") or u.startswith("https://")):
-        return f"**[{t}](<{u}>)**"
+        return f"**[{t}]({u})**"
     return f"**{t}**"
 
 
