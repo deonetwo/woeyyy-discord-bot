@@ -357,10 +357,7 @@ class TestDiscordVoiceBot(unittest.TestCase):
         mock_interaction.user.voice.channel = MagicMock()
         mock_interaction.response.defer = AsyncMock()
 
-        # Mock msg_handle
-        mock_msg_handle = MagicMock()
-        mock_msg_handle.edit = AsyncMock()
-        mock_interaction.followup.send = AsyncMock(return_value=mock_msg_handle)
+        mock_interaction.followup.send = AsyncMock()
 
         sample_track = {
             "title": "Special Song",
@@ -373,14 +370,13 @@ class TestDiscordVoiceBot(unittest.TestCase):
              patch.object(bot, "_async_enqueue_or_play", new=AsyncMock(return_value=(True, "Now playing", False, sample_track))):
             asyncio.run(cmd.callback(mock_interaction, "Special Song"))
 
-        # Check msg_handle.edit was called
-        mock_msg_handle.edit.assert_called_once()
-        call_kwargs = mock_msg_handle.edit.call_args[1]
-        self.assertIn("content", call_kwargs)
-        self.assertIn("Special Song", call_kwargs["content"])
-        self.assertIn("Special Artist", call_kwargs["content"])
-        # Crucial check: verify suppress was NOT passed (which caused TypeError on WebhookMessage)
-        self.assertNotIn("suppress", call_kwargs)
+        # Check followup.send was called with suppress_embeds=True
+        mock_interaction.followup.send.assert_called_once()
+        sent_text = mock_interaction.followup.send.call_args[0][0]
+        send_kwargs = mock_interaction.followup.send.call_args[1]
+        self.assertIn("Special Song", sent_text)
+        self.assertIn("Special Artist", sent_text)
+        self.assertTrue(send_kwargs.get("suppress_embeds"), "followup.send must set suppress_embeds=True")
 
         # Verify track was recorded to user history
         history = bot.get_user_history(test_uid)

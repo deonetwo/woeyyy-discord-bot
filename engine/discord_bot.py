@@ -1794,11 +1794,6 @@ class DiscordVoiceBot:
                 )
                 return
 
-            # Send immediate feedback tailored to input type
-            is_direct_url = query.strip().startswith("http://") or query.strip().startswith("https://")
-            status_msg = "Loading audio..." if is_direct_url else "Searching YouTube..."
-            msg_handle = await interaction.followup.send(status_msg)
-
             self._notify_status("SEARCHING", "Searching for track...")
 
             requester_name = interaction.user.display_name
@@ -1810,7 +1805,10 @@ class DiscordVoiceBot:
 
                 if not success:
                     logger.warning(f"Failed to load audio for '{query}': {msg}")
-                    await msg_handle.edit(content="Could not load audio. Please check the song title or URL and try again.")
+                    await interaction.followup.send(
+                        "Could not load audio. Please check the song title or URL and try again.",
+                        ephemeral=True,
+                    )
                     return
 
                 # Record track to user's history immediately upon retrieval
@@ -1835,11 +1833,14 @@ class DiscordVoiceBot:
                 else:
                     msg_text = f"{prefix}Added {link_part}{uploader_part}{dur_part} to begin playing."
 
-                await msg_handle.edit(content=msg_text)
+                await interaction.followup.send(msg_text, suppress_embeds=True)
             except Exception as e:
                 logger.error(f"Error during /play command execution: {e}")
                 try:
-                    await msg_handle.edit(content="Could not load audio. Please check the song title or URL and try again.")
+                    await interaction.followup.send(
+                        "Could not load audio. Please check the song title or URL and try again.",
+                        ephemeral=True,
+                    )
                 except Exception:
                     pass
 
