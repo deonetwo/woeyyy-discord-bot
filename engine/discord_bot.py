@@ -1467,6 +1467,9 @@ class DiscordVoiceBot:
         self._autoplay_played_ids: Set[str] = set(auto_data.get("played_ids", []))
         self._manual_stop: bool = False
         self._manual_skip: bool = False
+        self._manual_leave: bool = False
+        self.last_active_channel_id: Optional[int] = None
+        self.last_active_guild_id: Optional[int] = None
         self.last_text_channel: Optional[discord.abc.Messageable] = None
 
     def _bind_text_channel(
@@ -1681,10 +1684,56 @@ class DiscordVoiceBot:
         self.voice_client = vc
         self.is_in_voice = True
         self.current_channel_id = channel.id
+        self.last_active_channel_id = channel.id
+        if hasattr(channel, "guild"):
+            self.last_active_guild_id = channel.guild.id
+        self._manual_leave = False
         self._notify_status("VOICE_CONNECTED", channel.name)
         if not self.is_playing and not self.is_paused:
             await self._update_voice_channel_status("Waiting for song requests", channel_id=channel.id)
         return vc
+
+    async def _recover_voice_connection(self, channel: Optional[discord.VoiceChannel], pending_track: Optional[Dict[str, any]]):
+        """
+        Automatically recover voice connection and resume playback when Discord
+        encounters transient voice gateway / RTC server drops or region migrations.
+        """
+        if not channel or self._manual_leave or self._manual_stop or not self.is_connected:
+            return
+
+        ch_name = getattr(channel, "name", str(channel))
+        logger.info(f"Initiating voice auto-recovery for channel '#{ch_name}'...")
+        for attempt in range(1, 4):
+            if self._manual_leave or self._manual_stop or not self.is_connected:
+                return
+            await asyncio.sleep(1.5 * attempt)
+            try:
+                # Check if discord.py already recovered the voice client internally
+                if self.voice_client and self.voice_client.is_connected() and getattr(self.voice_client, "channel", None) and self.voice_client.channel.id == channel.id:
+                    logger.info("Voice connection recovered by gateway.")
+                    self.is_in_voice = True
+                    self.current_channel_id = channel.id
+                    if pending_track and (not self.voice_client.is_playing() and not self.voice_client.is_paused()):
+                        await self._async_play_track(pending_track, announce=False)
+                    return
+
+                # Actively reconnect to voice channel
+                vc = await self._ensure_voice_connected(channel)
+                if vc and vc.is_connected():
+                    logger.info(f"Successfully reconnected to voice channel '#{ch_name}' (attempt {attempt}/3).")
+                    if pending_track:
+                        await self._async_play_track(pending_track, announce=False)
+                    elif self.queue:
+                        next_song = self.queue.pop(0)
+                        await self._async_play_track(next_song, announce=True)
+                    elif self.autoplay:
+                        self.trigger_autoplay()
+                    return
+            except Exception as e:
+                logger.warning(f"Voice auto-recovery attempt {attempt}/3 failed: {e}")
+
+        logger.error(f"Voice auto-recovery exhausted all retries for channel '#{ch_name}'.")
+        self.leave_voice_channel()
 
     async def _update_voice_channel_status(self, status: Optional[str], channel_id: Optional[int] = None):
         """
@@ -2349,26 +2398,49 @@ class DiscordVoiceBot:
         @self.client.event
         async def on_voice_state_update(member, before, after):
             if member == self.client.user:
+                logger.info(f"Bot voice state updated: before={getattr(before, 'channel', None)}, after={getattr(after, 'channel', None)}")
                 if after.channel is None:
                     # Bot was disconnected from voice channel
-                    self.is_in_voice = False
-                    if before and before.channel and hasattr(before.channel, "guild"):
-                        g_vc = getattr(before.channel.guild, "voice_client", None)
-                        if g_vc:
-                            try:
-                                await g_vc.disconnect(force=True)
-                            except Exception:
-                                pass
-                    self.voice_client = None
-                    self.current_channel_id = None
-                    self._empty_since = None
-                    self._idle_since = None
-                    self._notify_status("VOICE_DISCONNECTED", "Left voice channel")
+                    was_playing = self.is_playing or self.is_paused
+                    last_track = self.current_track
+                    target_ch = before.channel if before and before.channel else (self.client.get_channel(self.last_active_channel_id) if self.last_active_channel_id else None)
+
+                    if self._manual_leave:
+                        self._manual_leave = False
+                        self.is_in_voice = False
+                        if before and before.channel and hasattr(before.channel, "guild"):
+                            g_vc = getattr(before.channel.guild, "voice_client", None)
+                            if g_vc:
+                                try:
+                                    await g_vc.disconnect(force=True)
+                                except Exception:
+                                    pass
+                        self.voice_client = None
+                        self.current_channel_id = None
+                        self._empty_since = None
+                        self._idle_since = None
+                        self._notify_status("VOICE_DISCONNECTED", "Left voice channel")
+                    else:
+                        # Unexpected voice disconnection (network drop / Discord voice server reset)
+                        ch_name = getattr(target_ch, 'name', 'unknown')
+                        logger.warning(
+                            f"Unexpected voice disconnect detected from #{ch_name} "
+                            f"(was_playing={was_playing}, autoplay={self.autoplay}). Launching auto-recovery..."
+                        )
+                        self.is_in_voice = False
+                        self.voice_client = None
+                        self.current_channel_id = None
+                        if self._loop and self._loop.is_running():
+                            self._loop.create_task(self._recover_voice_connection(target_ch, last_track if was_playing else None))
                 else:
                     self.is_in_voice = True
                     self.current_channel_id = after.channel.id
+                    self.last_active_channel_id = after.channel.id
+                    if hasattr(after.channel, "guild"):
+                        self.last_active_guild_id = after.channel.guild.id
                     self.voice_client = getattr(after.channel.guild, "voice_client", None)
                     self._empty_since = None
+                    self._manual_leave = False
                     if not self.is_playing and not self.is_paused:
                         self._idle_since = time.time()
                     self._notify_status("VOICE_CONNECTED", after.channel.name)
@@ -2483,6 +2555,7 @@ class DiscordVoiceBot:
 
     def leave_voice_channel(self):
         """Disconnect the bot from its current voice channel."""
+        self._manual_leave = True
         if not self._loop:
             return
 
