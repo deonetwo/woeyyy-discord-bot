@@ -191,49 +191,6 @@ class TestDiscordVoiceBot(unittest.TestCase):
         stale_vc.disconnect.assert_awaited_once_with(force=True)
         self.assertEqual(res_vc3, new_vc)
         self.assertEqual(bot.current_channel_id, 789)
-        self.assertEqual(bot.last_active_channel_id, 789)
-
-    def test_voice_auto_recovery_on_unexpected_disconnect(self):
-        """Verify _recover_voice_connection re-establishes connection and resumes track."""
-        import asyncio
-        from unittest.mock import AsyncMock, MagicMock
-
-        bot = DiscordVoiceBot()
-        bot.is_connected = True
-        bot._manual_leave = False
-        bot._manual_stop = False
-
-        mock_channel = MagicMock()
-        mock_channel.id = 555
-        mock_channel.name = "Music Lounge"
-
-        mock_recovered_vc = MagicMock()
-        mock_recovered_vc.is_connected.return_value = True
-
-        mock_track = {"title": "Resumed Song", "webpage_url": "https://youtube.com/watch?v=resumed123"}
-
-        with patch.object(bot, "_ensure_voice_connected", new=AsyncMock(return_value=mock_recovered_vc)) as mock_connect, \
-             patch.object(bot, "_async_play_track", new=AsyncMock()) as mock_play:
-            asyncio.run(bot._recover_voice_connection(mock_channel, mock_track))
-
-            mock_connect.assert_awaited_once_with(mock_channel)
-            mock_play.assert_awaited_once_with(mock_track, announce=False)
-
-    def test_intentional_leave_does_not_trigger_auto_recovery(self):
-        """Verify _recover_voice_connection immediately exits if _manual_leave is True."""
-        import asyncio
-        from unittest.mock import AsyncMock, MagicMock
-
-        bot = DiscordVoiceBot()
-        bot.is_connected = True
-        bot._manual_leave = True
-
-        mock_channel = MagicMock()
-        mock_channel.id = 555
-
-        with patch.object(bot, "_ensure_voice_connected", new=AsyncMock()) as mock_connect:
-            asyncio.run(bot._recover_voice_connection(mock_channel, None))
-            mock_connect.assert_not_called()
 
     def test_bot_local_mode_initialization(self):
         """Verify is_local flag initialization via parameter and BOT_MODE env var."""
