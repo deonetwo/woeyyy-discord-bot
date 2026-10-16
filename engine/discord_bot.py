@@ -987,6 +987,159 @@ class AudioCacheIndex:
         with self._lock:
             return len(self._index)
 
+    def get_cached_suggestions(
+        self,
+        cache_dir: str,
+        query: str = "",
+        limit: int = 25,
+    ) -> List[Dict[str, str]]:
+        """
+        Return up to `limit` suggestions for cached tracks matching `query`.
+        Used for Discord slash command autocomplete (e.g. /deletecache).
+        Returns list of {"name": label, "value": vid_id}.
+        """
+        if not os.path.exists(cache_dir):
+            return []
+
+        if cache_dir not in self._loaded_dirs or not self._index:
+            self.sync_from_disk(cache_dir)
+
+        clean_q = query.strip().lower()
+        items = []
+
+        with self._lock:
+            for vid_id, entry in list(self._index.items()):
+                fp = entry.get("filepath", "")
+                if not fp or not os.path.exists(fp):
+                    continue
+
+                meta = entry.get("meta", {})
+                title = meta.get("title", "").strip() or vid_id
+                uploader = meta.get("uploader", "").strip()
+                dur_str = meta.get("duration_str", "").strip()
+
+                if clean_q:
+                    search_str = f"{title.lower()} {uploader.lower()} {vid_id.lower()}"
+                    if clean_q not in search_str:
+                        continue
+
+                label = title
+                if uploader:
+                    label = f"{title} - {uploader}"
+                if dur_str:
+                    label += f" ({dur_str})"
+
+                if len(label) > 100:
+                    label = label[:97] + "..."
+
+                items.append({"name": label, "value": vid_id})
+                if len(items) >= limit:
+                    break
+
+        return items
+
+    def delete(
+        self,
+        cache_dir: str,
+        vid_id_or_query: str,
+    ) -> Tuple[bool, str, Optional[Dict[str, any]]]:
+        """
+        Permanently remove a track from disk and from in-memory RAM cache.
+        Removes audio file(s) (e.g. .opus, .webm, .m4a), metadata (.json), and evicts from RAM index.
+        Returns: (success: bool, message: str, meta: Optional[Dict[str, any]])
+        """
+        if not vid_id_or_query or not os.path.exists(cache_dir):
+            return False, "Invalid track identifier or cache directory not found.", None
+
+        if cache_dir not in self._loaded_dirs or not self._index:
+            self.sync_from_disk(cache_dir)
+
+        target_input = vid_id_or_query.strip()
+        vid = extract_youtube_video_id(target_input) if (target_input.startswith("http://") or target_input.startswith("https://")) else ""
+        if not vid and bool(re.match(r"^[A-Za-z0-9_-]{11}$", target_input)):
+            vid = target_input
+
+        found_fp = None
+        found_meta = None
+
+        with self._lock:
+            # 1. Direct match by video ID in index
+            if vid and vid in self._index:
+                entry = self._index.pop(vid, None)
+                if entry:
+                    found_fp = entry.get("filepath")
+                    found_meta = entry.get("meta")
+
+            # 2. Match by exact title or query search
+            if not found_fp:
+                search_fp, search_meta = self.search_by_query(cache_dir, target_input)
+                if search_fp and search_meta:
+                    search_vid = search_meta.get("video_id") or extract_youtube_video_id(search_meta.get("webpage_url", ""))
+                    if not search_vid:
+                        search_vid = os.path.splitext(os.path.basename(search_fp))[0]
+                    vid = search_vid
+                    found_fp = search_fp
+                    found_meta = search_meta
+                    self._index.pop(vid, None)
+
+            # 3. Substring match across indexed titles
+            if not found_fp:
+                clean_target = target_input.lower()
+                for v_id, entry in list(self._index.items()):
+                    meta = entry.get("meta", {})
+                    t_title = meta.get("title", "").lower()
+                    if clean_target in t_title or clean_target in v_id.lower():
+                        vid = v_id
+                        found_fp = entry.get("filepath")
+                        found_meta = entry.get("meta")
+                        self._index.pop(v_id, None)
+                        break
+
+        if not vid:
+            return False, f"Song '{target_input}' was not found in the cache.", None
+
+        # Delete matching audio files
+        audio_exts = (".opus", ".webm", ".m4a", ".mp3", ".ogg", ".wav", ".flac", ".aac")
+        deleted_files = 0
+
+        if found_fp and os.path.exists(found_fp):
+            try:
+                os.remove(found_fp)
+                deleted_files += 1
+            except OSError as e:
+                logger.warning(f"Failed to delete audio file {found_fp}: {e}")
+
+        for ext in audio_exts:
+            potential_path = os.path.join(cache_dir, f"{vid}{ext}")
+            if os.path.exists(potential_path):
+                try:
+                    os.remove(potential_path)
+                    deleted_files += 1
+                except OSError as e:
+                    logger.warning(f"Failed to delete {potential_path}: {e}")
+
+        # Delete metadata json
+        meta_json_path = os.path.join(cache_dir, f"{vid}.json")
+        if os.path.exists(meta_json_path):
+            if not found_meta:
+                try:
+                    with open(meta_json_path, "r", encoding="utf-8") as jf:
+                        found_meta = json.load(jf)
+                except Exception:
+                    pass
+            try:
+                os.remove(meta_json_path)
+                deleted_files += 1
+            except OSError as e:
+                logger.warning(f"Failed to delete {meta_json_path}: {e}")
+
+        if deleted_files > 0 or found_meta:
+            title = (found_meta or {}).get("title", vid)
+            logger.info(f"Deleted cached track: '{title}' ({vid}) from {cache_dir}")
+            return True, f"Deleted '{title}' from cache.", found_meta or {"title": vid, "video_id": vid}
+
+        return False, f"Song '{target_input}' was not found in the cache.", None
+
 
 AUDIO_CACHE_INDEX = AudioCacheIndex()
 
@@ -1005,6 +1158,11 @@ def find_cached_track_by_query(cache_dir: str, query: str) -> Tuple[Optional[str
     Serviced directly from in-memory RAM cache (<0.05 ms).
     """
     return AUDIO_CACHE_INDEX.search_by_query(cache_dir, query)
+
+
+def delete_cached_track(cache_dir: str, vid_id_or_query: str) -> Tuple[bool, str, Optional[Dict[str, any]]]:
+    """Permanently delete a cached track from disk and RAM cache."""
+    return AUDIO_CACHE_INDEX.delete(cache_dir, vid_id_or_query)
 
 
 def create_track_from_cached_meta(
@@ -2368,6 +2526,49 @@ class DiscordVoiceBot:
                 except Exception:
                     pass
 
+        @bot.tree.command(name="deletecache", description="Delete a cached song from local storage")
+        @app_commands.describe(song="Song title, YouTube URL, or choose from cached list")
+        async def cmd_deletecache(interaction: discord.Interaction, song: str):
+            if not interaction.user.voice or not interaction.user.voice.channel:
+                await interaction.response.send_message(
+                    "You must be in a voice channel to use this command.",
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.defer(ephemeral=False)
+            try:
+                success, msg, deleted_track = self.delete_cached_song(song)
+                emoji = get_random_server_emoji(interaction.guild)
+                prefix = f"{emoji} " if emoji else ""
+                if success:
+                    title = deleted_track.get("title", song) if deleted_track else song
+                    url = deleted_track.get("webpage_url", "") if deleted_track else ""
+                    uploader = deleted_track.get("uploader", "") if deleted_track else ""
+                    link_part = format_song_link(title, url)
+                    uploader_part = f" by **{uploader}**" if uploader else ""
+                    await interaction.followup.send(
+                        f"{prefix}Deleted {link_part}{uploader_part} from the local cache.",
+                        suppress_embeds=True,
+                    )
+                else:
+                    await interaction.followup.send(f"❌ {msg}", ephemeral=True)
+            except Exception as e:
+                logger.error(f"Error in cmd_deletecache: {e}")
+                await interaction.followup.send("Failed to delete song from cache.", ephemeral=True)
+
+        @cmd_deletecache.autocomplete("song")
+        async def deletecache_autocomplete(
+            interaction: discord.Interaction,
+            current: str,
+        ) -> List[app_commands.Choice[str]]:
+            clean = current.strip() if current else ""
+            suggestions = AUDIO_CACHE_INDEX.get_cached_suggestions(AUDIO_CACHE_DIR, clean, limit=25)
+            return [
+                app_commands.Choice(name=item["name"], value=item["value"])
+                for item in suggestions
+            ]
+
         @bot.tree.error
         async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
             cmd_name = interaction.command.name if interaction.command else "unknown"
@@ -3621,3 +3822,35 @@ class DiscordVoiceBot:
             else:
                 logger.info("Autoplay: No cached tracks found in cache/.")
         return None
+
+    def delete_cached_song(self, song_query: str) -> Tuple[bool, str, Optional[Dict[str, any]]]:
+        """
+        Delete a song from local cache directory, RAM index, active queue, and daily autoplay history.
+        Returns: (success: bool, message: str, deleted_track_meta: Optional[Dict[str, any]])
+        """
+        cache_dir = AUDIO_CACHE_DIR
+        success, msg, deleted_meta = AUDIO_CACHE_INDEX.delete(cache_dir, song_query)
+        if success and deleted_meta:
+            vid = deleted_meta.get("video_id") or ""
+            # Evict from daily autoplay history
+            if vid:
+                with self._autoplay_lock:
+                    self._autoplay_played_ids.discard(vid)
+                try:
+                    save_autoplay_history({
+                        "date": self._autoplay_date,
+                        "played_ids": list(self._autoplay_played_ids),
+                    })
+                except Exception:
+                    pass
+
+            # Remove from queue if present
+            old_queue_len = len(self.queue)
+            self.queue = [
+                t for t in self.queue
+                if (t.get("video_id") != vid and t.get("filepath") != deleted_meta.get("filepath"))
+            ]
+            if len(self.queue) != old_queue_len:
+                self._notify_status("QUEUE_UPDATED", "")
+
+        return success, msg, deleted_meta

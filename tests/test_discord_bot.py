@@ -1676,6 +1676,101 @@ class TestDiscordVoiceBot(unittest.TestCase):
         self.assertEqual(bot.autoplay_max_duration, 600)
         self.assertEqual(bot.autoplay_max_duration, MAX_AUTOPLAY_DURATION_SEC)
 
+    def test_audio_cache_index_get_cached_suggestions(self):
+        """Verify get_cached_suggestions returns matching tracks for autocomplete."""
+        import tempfile
+        from engine.discord_bot import AudioCacheIndex
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            index = AudioCacheIndex()
+            f1 = os.path.join(tmpdir, "vid11111111.opus")
+            f2 = os.path.join(tmpdir, "vid22222222.webm")
+            with open(f1, "wb") as f:
+                f.write(b"0" * 2048)
+            with open(f2, "wb") as f:
+                f.write(b"0" * 2048)
+
+            index.put(tmpdir, "vid11111111", {"title": "Shape of You", "uploader": "Ed Sheeran", "duration_str": "3:53"}, f1)
+            index.put(tmpdir, "vid22222222", {"title": "Perfect", "uploader": "Ed Sheeran", "duration_str": "4:23"}, f2)
+
+            # Query matching all
+            all_items = index.get_cached_suggestions(tmpdir, "")
+            self.assertEqual(len(all_items), 2)
+
+            # Query matching "Shape"
+            shape_items = index.get_cached_suggestions(tmpdir, "shape")
+            self.assertEqual(len(shape_items), 1)
+            self.assertEqual(shape_items[0]["value"], "vid11111111")
+            self.assertIn("Shape of You", shape_items[0]["name"])
+
+            # Query matching "Ed Sheeran"
+            artist_items = index.get_cached_suggestions(tmpdir, "ed sheeran")
+            self.assertEqual(len(artist_items), 2)
+
+    def test_audio_cache_index_delete_track(self):
+        """Verify deleting a cached track removes audio files, json, and RAM index."""
+        import tempfile
+        from engine.discord_bot import AudioCacheIndex, delete_cached_track
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            index = AudioCacheIndex()
+            vid = "targetvid12"
+            f_opus = os.path.join(tmpdir, f"{vid}.opus")
+            f_json = os.path.join(tmpdir, f"{vid}.json")
+            with open(f_opus, "wb") as f:
+                f.write(b"0" * 2048)
+            with open(f_json, "w", encoding="utf-8") as f:
+                json.dump({"title": "Delete Me Song", "video_id": vid}, f)
+
+            index.put(tmpdir, vid, {"title": "Delete Me Song", "video_id": vid}, f_opus)
+            self.assertEqual(len(index), 1)
+            self.assertTrue(os.path.exists(f_opus))
+            self.assertTrue(os.path.exists(f_json))
+
+            # Delete by title
+            success, msg, deleted_meta = index.delete(tmpdir, "Delete Me Song")
+            self.assertTrue(success)
+            self.assertEqual(deleted_meta["video_id"], vid)
+            self.assertEqual(len(index), 0)
+            self.assertFalse(os.path.exists(f_opus), "Audio file must be deleted from disk")
+            self.assertFalse(os.path.exists(f_json), "Metadata JSON must be deleted from disk")
+
+            # Deleting again returns False
+            success_again, msg2, _ = index.delete(tmpdir, vid)
+            self.assertFalse(success_again)
+            self.assertIn("not found", msg2)
+
+    def test_discord_voice_bot_delete_cached_song_cleans_queue_and_history(self):
+        """Verify bot delete_cached_song removes track from queue and smart autoplay history."""
+        import tempfile
+        from engine.discord_bot import DiscordVoiceBot, AUDIO_CACHE_INDEX
+
+        bot = DiscordVoiceBot()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vid = "qvid1234567"
+            f_webm = os.path.join(tmpdir, f"{vid}.webm")
+            with open(f_webm, "wb") as f:
+                f.write(b"0" * 2048)
+
+            meta = {"title": "Queued And Cached", "video_id": vid, "filepath": f_webm}
+            AUDIO_CACHE_INDEX.put(tmpdir, vid, meta, f_webm)
+
+            # Enqueue and record in autoplay history
+            bot.queue.append(dict(meta))
+            bot.record_autoplay_track(vid)
+            self.assertIn(vid, bot._get_autoplay_played_ids_today())
+            self.assertEqual(len(bot.queue), 1)
+
+            # Mock AUDIO_CACHE_DIR to tmpdir
+            with patch("engine.discord_bot.AUDIO_CACHE_DIR", tmpdir):
+                success, msg, deleted = bot.delete_cached_song(vid)
+                self.assertTrue(success)
+                self.assertEqual(deleted["video_id"], vid)
+                # Verify queue eviction
+                self.assertEqual(len(bot.queue), 0, "Song must be evicted from active queue")
+                # Verify daily history eviction
+                self.assertNotIn(vid, bot._get_autoplay_played_ids_today(), "Song must be evicted from daily history")
+
 
 if __name__ == "__main__":
     unittest.main()

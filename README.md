@@ -36,6 +36,7 @@ The project is completely headless, with no GUI dependencies or local audio devi
 | `/stop` | Stop playback and clear queue |
 | `/autoplay [mode]` | Control autoplay mode (`smart`, `standard`, `on`, `off`, `reset`, `status`, or interactive dropdown) |
 | `/smartautoplay [action]` | Shortcut for Smart Autoplay (`on`, `off`, `reset`, `status`) |
+| `/deletecache <song>` | Delete a cached track from local storage (with autocomplete) |
 | `/volume <0-150>` | Set playback volume percentage |
 | `/leave` | Disconnect bot from voice channel |
 
@@ -51,6 +52,7 @@ When running interactively (`python main.py`):
 - `stop`: Stop playback and clear queue
 - `a, autoplay [mode]`: Control autoplay (`smart`, `standard`, `off`, `reset`, `status`)
 - `smartautoplay [mode]`: Shortcut to manage Smart Autoplay
+- `deletecache <song>`: Delete a cached track from local storage
 - `v, vol <0-150>`: Set volume percentage
 - `logs [n]`: Show recent bot operational logs (default: 20)
 - `help`: Display help message

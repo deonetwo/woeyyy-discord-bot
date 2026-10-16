@@ -63,6 +63,7 @@ def print_help():
     print("  resume                - Resume playback")
     print("  a, autoplay [mode]    - Autoplay controls: smart, standard, off, reset, status")
     print("  smartautoplay [mode]  - Shortcut for Smart Autoplay (no repeats today)")
+    print("  deletecache <song>    - Delete a song from local cache")
     print("  v, vol <0-150>        - Set playback volume percentage")
     print("  logs [n]              - Show recent bot operational logs (default: 20)")
     print("  help                  - Show this help list")
@@ -299,6 +300,16 @@ def main():
                     print(f"Remaining unplayed today: {st['remaining_unplayed']}")
                 else:
                     print("Usage: autoplay [smart/standard/off/reset/status]")
+
+            elif cmd in ("delcache", "deletecache", "rmcache"):
+                if not arg:
+                    print("Usage: deletecache <song title, video ID, or YouTube URL>")
+                else:
+                    success, msg, track = bot.delete_cached_song(arg)
+                    if success:
+                        print(f"Success: {msg}")
+                    else:
+                        print(f"Error: {msg}")
 
             elif cmd in ("v", "vol", "volume"):
                 if not arg:
