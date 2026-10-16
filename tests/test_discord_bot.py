@@ -1595,6 +1595,87 @@ class TestDiscordVoiceBot(unittest.TestCase):
             # In standard mode, track must not be recorded into daily smart history
             self.assertNotIn("repeatable_vid", bot._get_autoplay_played_ids_today())
 
+    def test_parse_duration_to_seconds(self):
+        """Verify parse_duration_to_seconds handles all formats accurately."""
+        from engine.discord_bot import parse_duration_to_seconds
+
+        self.assertEqual(parse_duration_to_seconds("3:45"), 225)
+        self.assertEqual(parse_duration_to_seconds("09:59"), 599)
+        self.assertEqual(parse_duration_to_seconds("10:00"), 600)
+        self.assertEqual(parse_duration_to_seconds("12:34"), 754)
+        self.assertEqual(parse_duration_to_seconds("1:02:15"), 3735)
+        self.assertEqual(parse_duration_to_seconds("Live"), 0)
+        self.assertEqual(parse_duration_to_seconds(""), 0)
+        self.assertEqual(parse_duration_to_seconds(None), 0)
+        self.assertEqual(parse_duration_to_seconds("invalid"), 0)
+
+    def test_autoplay_excludes_songs_ten_minutes_or_longer(self):
+        """Verify get_random_track only picks songs that have duration < 10 minutes (<600s)."""
+        import tempfile
+        from engine.discord_bot import AudioCacheIndex, MAX_AUTOPLAY_DURATION_SEC
+
+        self.assertEqual(MAX_AUTOPLAY_DURATION_SEC, 600)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            index = AudioCacheIndex()
+
+            # Create dummy audio files
+            files = {}
+            for name in ("SHORT_1", "SHORT_2", "EXACT_10M", "LONG_1", "LONG_2"):
+                fpath = os.path.join(tmpdir, f"{name}.opus")
+                with open(fpath, "wb") as f:
+                    f.write(b"0" * 2048)
+                files[name] = fpath
+
+            # Short songs (< 10 minutes)
+            index.put(tmpdir, "SHORT_1", {"title": "Short Song 1", "video_id": "SHORT_1", "duration_sec": 180, "duration_str": "3:00"}, files["SHORT_1"])
+            index.put(tmpdir, "SHORT_2", {"title": "Short Song 2", "video_id": "SHORT_2", "duration_sec": 599, "duration_str": "9:59"}, files["SHORT_2"])
+
+            # Songs that are 10 minutes or longer (>= 600s)
+            index.put(tmpdir, "EXACT_10M", {"title": "Ten Min Song", "video_id": "EXACT_10M", "duration_sec": 600, "duration_str": "10:00"}, files["EXACT_10M"])
+            index.put(tmpdir, "LONG_1", {"title": "Long Song 1", "video_id": "LONG_1", "duration_sec": 720, "duration_str": "12:00"}, files["LONG_1"])
+            index.put(tmpdir, "LONG_2", {"title": "Long Song 2", "video_id": "LONG_2", "duration_sec": 3600, "duration_str": "1:00:00"}, files["LONG_2"])
+
+            # Over 20 iterations, get_random_track should only pick SHORT_1 or SHORT_2
+            picked_vids = set()
+            for _ in range(20):
+                res = index.get_random_track(tmpdir)
+                self.assertIsNotNone(res)
+                fp, meta = res
+                vid = meta["video_id"]
+                picked_vids.add(vid)
+                self.assertIn(vid, {"SHORT_1", "SHORT_2"}, f"Autoplay must only pick songs < 10 minutes, but picked {vid}")
+
+            self.assertEqual(picked_vids, {"SHORT_1", "SHORT_2"})
+
+            # If all short songs are excluded (e.g. played today), it must return None instead of picking long songs
+            res_all_played = index.get_random_track(tmpdir, exclude_vid_ids={"SHORT_1", "SHORT_2"})
+            self.assertIsNone(res_all_played, "Must return None when all remaining tracks in cache are >= 10 minutes")
+
+    def test_autoplay_duration_fallback_from_duration_str(self):
+        """Verify get_random_track detects >= 10 minute songs even if duration_sec is 0 but duration_str is set."""
+        import tempfile
+        from engine.discord_bot import AudioCacheIndex
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            index = AudioCacheIndex()
+            fpath = os.path.join(tmpdir, "LONG_STR.opus")
+            with open(fpath, "wb") as f:
+                f.write(b"0" * 2048)
+
+            # duration_sec is 0, but duration_str is "14:20"
+            index.put(tmpdir, "LONG_STR", {"title": "Long Via Str", "video_id": "LONG_STR", "duration_sec": 0, "duration_str": "14:20"}, fpath)
+            res = index.get_random_track(tmpdir)
+            self.assertIsNone(res, "Must filter out track whose duration_str indicates >= 10 minutes")
+
+    def test_discord_voice_bot_autoplay_max_duration_default(self):
+        """Verify DiscordVoiceBot initializes autoplay_max_duration to 600s."""
+        from engine.discord_bot import DiscordVoiceBot, MAX_AUTOPLAY_DURATION_SEC
+
+        bot = DiscordVoiceBot()
+        self.assertEqual(bot.autoplay_max_duration, 600)
+        self.assertEqual(bot.autoplay_max_duration, MAX_AUTOPLAY_DURATION_SEC)
+
 
 if __name__ == "__main__":
     unittest.main()

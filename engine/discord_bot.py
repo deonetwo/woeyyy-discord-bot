@@ -439,6 +439,7 @@ USER_HISTORY_PATH = os.path.join(AUDIO_CACHE_DIR, "user_history.json")
 AUTOPLAY_HISTORY_PATH = os.path.join(AUDIO_CACHE_DIR, "autoplay_history.json")
 DEFAULT_MAX_CACHE_MB = 500
 DEFAULT_MAX_CACHE_FILES = 50
+MAX_AUTOPLAY_DURATION_SEC = 600  # Autoplay only selects songs under 10 minutes (<600s)
 
 
 def load_env_file():
@@ -565,6 +566,26 @@ def get_audio_file_duration(filepath: str) -> Tuple[int, str]:
     except Exception:
         pass
     return 0, ""
+
+
+def parse_duration_to_seconds(dur_str: str) -> int:
+    """Parse duration string like '3:45', '03:45', or '1:12:30' into total seconds."""
+    if not dur_str or not isinstance(dur_str, str):
+        return 0
+    clean = dur_str.strip()
+    if clean.lower() in ("live", ""):
+        return 0
+    parts = clean.split(":")
+    try:
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(float(parts[2]))
+        elif len(parts) == 2:
+            return int(parts[0]) * 60 + int(float(parts[1]))
+        elif len(parts) == 1:
+            return int(float(parts[0]))
+    except (ValueError, TypeError):
+        pass
+    return 0
 
 
 class AudioCacheIndex:
@@ -804,12 +825,16 @@ class AudioCacheIndex:
         cache_dir: str,
         exclude_vid_id: Optional[str] = None,
         exclude_vid_ids: Optional[Union[Set[str], List[str], Tuple[str, ...]]] = None,
+        max_duration_sec: Optional[int] = MAX_AUTOPLAY_DURATION_SEC,
     ) -> Optional[Tuple[str, Dict[str, any]]]:
         """
         Return a random cached track (filepath, meta).
         exclude_vid_id: immediately preceding video ID to avoid back-to-back repeats.
         exclude_vid_ids: set of video IDs already played today (Smart Autoplay).
-        Returns None if no cached tracks exist or all available tracks have already been played today.
+        max_duration_sec: maximum allowed duration in seconds (default 600s / 10 minutes).
+                          Only picks songs strictly less than max_duration_sec (<10m).
+        Returns None if no cached tracks exist, or all available tracks have already been
+        played today, or all tracks exceed max_duration_sec.
         """
         if not os.path.exists(cache_dir):
             return None
@@ -856,6 +881,39 @@ class AudioCacheIndex:
             if not valid_candidates:
                 return None
 
+            def _get_candidate_duration(fp: str, meta: Dict[str, any]) -> int:
+                sec = meta.get("duration_sec", 0) or 0
+                if sec > 0:
+                    return sec
+                dur_str = meta.get("duration_str", "")
+                if dur_str:
+                    sec = parse_duration_to_seconds(dur_str)
+                    if sec > 0:
+                        meta["duration_sec"] = sec
+                        return sec
+                if fp and os.path.exists(fp):
+                    f_sec, f_dur = get_audio_file_duration(fp)
+                    if f_sec > 0:
+                        meta["duration_sec"] = f_sec
+                        if not meta.get("duration_str"):
+                            meta["duration_str"] = f_dur
+                        return f_sec
+                return 0
+
+            # Filter out tracks that exceed max_duration_sec (only pick < 10 minute songs)
+            if max_duration_sec is not None:
+                filtered_candidates = []
+                for c in valid_candidates:
+                    c_vid, c_fp, c_meta = c
+                    c_dur = _get_candidate_duration(c_fp, c_meta)
+                    if c_dur > 0 and c_dur >= max_duration_sec:
+                        continue
+                    filtered_candidates.append(c)
+                valid_candidates = filtered_candidates
+
+            if not valid_candidates:
+                return None
+
             to_exclude_today = set(exclude_vid_ids) if exclude_vid_ids else set()
 
             # Filter out tracks already played today by autoplay
@@ -871,15 +929,30 @@ class AudioCacheIndex:
             else:
                 pool = unplayed_today
 
-            chosen = random.choice(pool)
-            chosen_vid, chosen_fp, chosen_meta = chosen
-            title = chosen_meta.get("title", "").strip()
-            if not title or title == chosen_vid or re.match(r"^[A-Za-z0-9_-]{11}$", title):
-                chosen_meta = resolve_track_metadata(cache_dir, chosen_vid, chosen_meta, chosen_fp)
-                with self._lock:
-                    if chosen_vid in self._index:
-                        self._index[chosen_vid]["meta"] = chosen_meta
-            return chosen_fp, chosen_meta
+            while pool:
+                chosen = random.choice(pool)
+                chosen_vid, chosen_fp, chosen_meta = chosen
+
+                # Check candidate duration before and after resolution
+                c_dur = _get_candidate_duration(chosen_fp, chosen_meta)
+                if max_duration_sec is not None and c_dur > 0 and c_dur >= max_duration_sec:
+                    pool.remove(chosen)
+                    continue
+
+                title = chosen_meta.get("title", "").strip()
+                if not title or title == chosen_vid or re.match(r"^[A-Za-z0-9_-]{11}$", title):
+                    chosen_meta = resolve_track_metadata(cache_dir, chosen_vid, chosen_meta, chosen_fp)
+                    with self._lock:
+                        if chosen_vid in self._index:
+                            self._index[chosen_vid]["meta"] = chosen_meta
+                    c_dur = chosen_meta.get("duration_sec", 0) or 0
+                    if max_duration_sec is not None and c_dur > 0 and c_dur >= max_duration_sec:
+                        pool.remove(chosen)
+                        continue
+
+                return chosen_fp, chosen_meta
+
+            return None
 
     def put(self, cache_dir: str, vid_id: str, meta: Dict[str, any], audio_path: str):
         """Immediately update RAM cache index."""
@@ -1461,6 +1534,7 @@ class DiscordVoiceBot:
         # Smart Autoplay setting (plays unplayed random cached tracks today when queue is empty)
         self.autoplay: bool = os.environ.get("AUTOPLAY_ENABLED", "false").lower() in ("true", "1", "yes")
         self.smart_autoplay: bool = os.environ.get("SMART_AUTOPLAY_ENABLED", "true").lower() in ("true", "1", "yes")
+        self.autoplay_max_duration: int = int(os.environ.get("AUTOPLAY_MAX_DURATION_SEC", str(MAX_AUTOPLAY_DURATION_SEC)))
         self._autoplay_lock = threading.Lock()
         auto_data = load_autoplay_history()
         self._autoplay_date: str = auto_data.get("date", get_today_date_str())
@@ -3234,7 +3308,10 @@ class DiscordVoiceBot:
                     curr_vid = track.get("video_id") or extract_youtube_video_id(track.get("webpage_url", ""))
                     played_today = self._get_autoplay_played_ids_today() if self.smart_autoplay else None
                     random_cached = AUDIO_CACHE_INDEX.get_random_track(
-                        cache_dir, exclude_vid_id=curr_vid, exclude_vid_ids=played_today
+                        cache_dir,
+                        exclude_vid_id=curr_vid,
+                        exclude_vid_ids=played_today,
+                        max_duration_sec=self.autoplay_max_duration,
                     )
                     if random_cached:
                         cached_file, cached_meta = random_cached
@@ -3394,7 +3471,10 @@ class DiscordVoiceBot:
                 curr_vid = self.current_track.get("video_id") or extract_youtube_video_id(self.current_track.get("webpage_url", ""))
             played_today = self._get_autoplay_played_ids_today() if self.smart_autoplay else None
             random_cached = AUDIO_CACHE_INDEX.get_random_track(
-                cache_dir, exclude_vid_id=curr_vid, exclude_vid_ids=played_today
+                cache_dir,
+                exclude_vid_id=curr_vid,
+                exclude_vid_ids=played_today,
+                max_duration_sec=self.autoplay_max_duration,
             )
             if random_cached:
                 cached_file, cached_meta = random_cached
@@ -3516,7 +3596,10 @@ class DiscordVoiceBot:
             curr_vid = self.current_track.get("video_id") or extract_youtube_video_id(self.current_track.get("webpage_url", ""))
         played_today = self._get_autoplay_played_ids_today() if self.smart_autoplay else None
         random_cached = AUDIO_CACHE_INDEX.get_random_track(
-            cache_dir, exclude_vid_id=curr_vid, exclude_vid_ids=played_today
+            cache_dir,
+            exclude_vid_id=curr_vid,
+            exclude_vid_ids=played_today,
+            max_duration_sec=self.autoplay_max_duration,
         )
         if random_cached:
             cached_file, cached_meta = random_cached
