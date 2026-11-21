@@ -440,6 +440,18 @@ AUTOPLAY_HISTORY_PATH = os.path.join(AUDIO_CACHE_DIR, "autoplay_history.json")
 DEFAULT_MAX_CACHE_MB = 500
 DEFAULT_MAX_CACHE_FILES = 50
 MAX_AUTOPLAY_DURATION_SEC = 600  # Autoplay only selects songs under 10 minutes (<600s)
+SUPPORTED_AUDIO_EXTENSIONS: Tuple[str, ...] = (
+    ".opus",
+    ".webm",
+    ".m4a",
+    ".mp3",
+    ".ogg",
+    ".wav",
+    ".flac",
+    ".aac",
+    ".mp4",
+    ".mka",
+)
 
 
 def load_env_file():
@@ -606,7 +618,6 @@ class AudioCacheIndex:
         if not os.path.exists(cache_dir):
             return
 
-        audio_exts = (".opus", ".webm", ".m4a", ".mp3", ".ogg", ".wav", ".flac", ".aac")
         try:
             files = os.listdir(cache_dir)
         except OSError:
@@ -615,13 +626,15 @@ class AudioCacheIndex:
         json_files = {f[:-5]: f for f in files if f.endswith(".json") and f not in ("user_history.json", "autoplay_history.json")}
         audio_files = {}
         for f in files:
-            for ext in audio_exts:
+            for ext in SUPPORTED_AUDIO_EXTENSIONS:
                 if f.lower().endswith(ext):
                     base = f[:-len(ext)]
                     fpath = os.path.join(cache_dir, f)
                     try:
                         if os.path.isfile(fpath) and os.path.getsize(fpath) > 1024:
-                            audio_files[base] = fpath
+                            # Prefer dedicated audio containers (.opus, .webm, .m4a) over .mp4 if both exist
+                            if base not in audio_files or f.lower().endswith((".opus", ".webm", ".m4a")):
+                                audio_files[base] = fpath
                     except OSError:
                         pass
                     break
@@ -697,17 +710,26 @@ class AudioCacheIndex:
         if not os.path.exists(cache_dir) or not vid_id:
             return None, None
 
-        audio_exts = (".opus", ".webm", ".m4a", ".mp3", ".ogg", ".wav", ".flac", ".aac")
         cached_file = None
-        try:
-            for fname in os.listdir(cache_dir):
-                if fname.startswith(f"{vid_id}.") and fname.lower().endswith(audio_exts):
-                    full_path = os.path.join(cache_dir, fname)
-                    if os.path.isfile(full_path) and os.path.getsize(full_path) > 1024:
-                        cached_file = full_path
-                        break
-        except OSError:
-            return None, None
+        for ext in SUPPORTED_AUDIO_EXTENSIONS:
+            candidate = os.path.join(cache_dir, f"{vid_id}{ext}")
+            try:
+                if os.path.isfile(candidate) and os.path.getsize(candidate) > 1024:
+                    cached_file = candidate
+                    break
+            except OSError:
+                pass
+
+        if not cached_file:
+            try:
+                for fname in os.listdir(cache_dir):
+                    if fname.startswith(f"{vid_id}.") and fname.lower().endswith(SUPPORTED_AUDIO_EXTENSIONS):
+                        full_path = os.path.join(cache_dir, fname)
+                        if os.path.isfile(full_path) and os.path.getsize(full_path) > 1024:
+                            cached_file = full_path
+                            break
+            except OSError:
+                return None, None
 
         if not cached_file:
             return None, None
@@ -842,8 +864,6 @@ class AudioCacheIndex:
         if cache_dir not in self._loaded_dirs or not self._index:
             self.sync_from_disk(cache_dir)
 
-        audio_exts = (".opus", ".webm", ".m4a", ".mp3", ".ogg", ".wav", ".flac", ".aac")
-
         with self._lock:
             valid_candidates = []
             for vid_id, entry in list(self._index.items()):
@@ -859,7 +879,7 @@ class AudioCacheIndex:
                 # Fallback: scan disk directory directly if index was empty
                 try:
                     for fname in os.listdir(cache_dir):
-                        if fname.endswith(audio_exts):
+                        if fname.lower().endswith(SUPPORTED_AUDIO_EXTENSIONS):
                             vid = os.path.splitext(fname)[0]
                             fp = os.path.join(cache_dir, fname)
                             if os.path.isfile(fp) and os.path.getsize(fp) > 1024:
@@ -1099,7 +1119,6 @@ class AudioCacheIndex:
             return False, f"Song '{target_input}' was not found in the cache.", None
 
         # Delete matching audio files
-        audio_exts = (".opus", ".webm", ".m4a", ".mp3", ".ogg", ".wav", ".flac", ".aac")
         deleted_files = 0
 
         if found_fp and os.path.exists(found_fp):
@@ -1109,7 +1128,7 @@ class AudioCacheIndex:
             except OSError as e:
                 logger.warning(f"Failed to delete audio file {found_fp}: {e}")
 
-        for ext in audio_exts:
+        for ext in SUPPORTED_AUDIO_EXTENSIONS:
             potential_path = os.path.join(cache_dir, f"{vid}{ext}")
             if os.path.exists(potential_path):
                 try:
@@ -1215,19 +1234,26 @@ def create_track_from_cached_meta(
     }
 
 
-def save_track_cache_meta(cache_dir: str, vid_id: str, meta: Dict[str, any]):
+def save_track_cache_meta(
+    cache_dir: str,
+    vid_id: str,
+    meta: Dict[str, any],
+    audio_path: Optional[str] = None,
+):
     """Save track metadata to RAM cache and persist to cache/{vid_id}.json."""
     if not vid_id or not os.path.exists(cache_dir):
         return
 
     # Update in-memory RAM cache
-    audio_exts = (".opus", ".webm", ".m4a", ".mp3", ".ogg", ".wav", ".flac", ".aac")
     audio_file = None
-    for ext in audio_exts:
-        af = os.path.join(cache_dir, f"{vid_id}{ext}")
-        if os.path.isfile(af) and os.path.getsize(af) > 1024:
-            audio_file = af
-            break
+    if audio_path and os.path.isfile(audio_path) and os.path.getsize(audio_path) > 1024:
+        audio_file = audio_path
+    else:
+        for ext in SUPPORTED_AUDIO_EXTENSIONS:
+            af = os.path.join(cache_dir, f"{vid_id}{ext}")
+            if os.path.isfile(af) and os.path.getsize(af) > 1024:
+                audio_file = af
+                break
     if audio_file:
         AUDIO_CACHE_INDEX.put(cache_dir, vid_id, meta, audio_file)
 
@@ -1337,7 +1363,7 @@ def prune_audio_cache(
         max_bytes = max_bytes or cfg_bytes
         max_files = max_files or cfg_files
 
-    audio_exts = {".opus", ".webm", ".m4a", ".mp3", ".ogg", ".wav", ".flac", ".aac"}
+    audio_exts = set(SUPPORTED_AUDIO_EXTENSIONS)
     entries = []
     total_size = 0
 
@@ -3244,7 +3270,7 @@ class DiscordVoiceBot:
                     "video_id": target_vid,
                 }
                 def _bg_persist():
-                    save_track_cache_meta(cache_dir, target_vid, meta_dict)
+                    save_track_cache_meta(cache_dir, target_vid, meta_dict, audio_path=filepath)
                     prune_audio_cache(cache_dir)
 
                 loop.run_in_executor(None, _bg_persist)
@@ -3458,7 +3484,7 @@ class DiscordVoiceBot:
                                             }
                                             threading.Thread(
                                                 target=lambda: (
-                                                    save_track_cache_meta(cache_dir, fb_vid, fb_meta),
+                                                    save_track_cache_meta(cache_dir, fb_vid, fb_meta, audio_path=dl_filepath),
                                                     prune_audio_cache(cache_dir),
                                                 ),
                                                 daemon=True,

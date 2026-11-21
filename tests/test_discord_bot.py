@@ -1771,6 +1771,53 @@ class TestDiscordVoiceBot(unittest.TestCase):
                 # Verify daily history eviction
                 self.assertNotIn(vid, bot._get_autoplay_played_ids_today(), "Song must be evicted from daily history")
 
+    def test_mp4_cached_audio_indexing_and_lookup(self):
+        """Verify that .mp4 audio files are properly indexed, searched, and deleted."""
+        import tempfile
+        from engine.discord_bot import (
+            AudioCacheIndex,
+            save_track_cache_meta,
+            find_cached_track,
+            find_cached_track_by_query,
+            SUPPORTED_AUDIO_EXTENSIONS,
+        )
+
+        self.assertIn(".mp4", SUPPORTED_AUDIO_EXTENSIONS)
+        self.assertIn(".mka", SUPPORTED_AUDIO_EXTENSIONS)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vid = "_q4hEHqmLa0"
+            mp4_path = os.path.join(tmpdir, f"{vid}.mp4")
+            with open(mp4_path, "wb") as f:
+                f.write(b"M" * 4096)
+
+            meta = {
+                "title": "Michino Timothy Kimino Kimochi",
+                "uploader": "Chitose Morinaga - Topic",
+                "duration_sec": 215,
+                "duration_str": "3:35",
+                "webpage_url": f"https://www.youtube.com/watch?v={vid}",
+                "video_id": vid,
+            }
+            save_track_cache_meta(tmpdir, vid, meta, audio_path=mp4_path)
+
+            idx = AudioCacheIndex()
+            idx.sync_from_disk(tmpdir)
+            self.assertEqual(len(idx), 1)
+
+            fp, found_meta = idx.get(tmpdir, vid)
+            self.assertEqual(fp, mp4_path)
+            self.assertEqual(found_meta["title"], "Michino Timothy Kimino Kimochi")
+
+            q_fp, q_meta = idx.search_by_query(tmpdir, "Michino Timothy")
+            self.assertEqual(q_fp, mp4_path)
+            self.assertEqual(q_meta["video_id"], vid)
+
+            del_ok, del_msg, del_data = idx.delete(tmpdir, vid)
+            self.assertTrue(del_ok)
+            self.assertFalse(os.path.exists(mp4_path))
+            self.assertEqual(len(idx), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
